@@ -29,6 +29,8 @@ long sys_socket(int domain, int type, int protocol)
 			return -EINVAL;
 	}
 
+	type = socket_type_bsd_to_linux(type);
+
 #ifdef __NR_socketcall
 	ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_SOCKET,
 			((long[6]) { linux_domain, type, protocol }));

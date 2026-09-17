@@ -20,8 +20,6 @@ long sys_ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t tim
 {
 	int ret, op;
 	struct timespec ts;
-	bool no_errno = operation & XNU_ULF_NO_ERRNO;
-
 
 	// char dbg[100];
 	// __simple_sprintf(dbg, "ulock_wait on %p for %d ns", addr, timeout / 1000);
@@ -49,13 +47,16 @@ long sys_ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t tim
 			ret = 1;
 	}
 	else
-		return no_errno ? -(EINVAL | 0x800) : -EINVAL;
+		return -EINVAL;
 
 	if (ret < 0)
 	{
+		/* ULF_NO_ERRNO: XNU puts -errno in the syscall return and does
+		 * not set errno. libplatform then switch(-ret) on Darwin values
+		 * (EINTR, ETIMEDOUT, …). Do not AND ~0x800 here: -ETIMEDOUT
+		 * is -60, and (-60) & ~0x800 becomes -2108, which hits
+		 * libplatform's "ulock_wait failure" ud2. */
 		ret = errno_linux_to_bsd(ret);
-		if (no_errno)
-			ret &= ~0x800;
 	}
 
 	return ret;

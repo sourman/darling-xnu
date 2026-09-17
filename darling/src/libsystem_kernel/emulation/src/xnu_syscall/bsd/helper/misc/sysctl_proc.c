@@ -23,17 +23,8 @@
 #	define DT_DIR	4
 #endif
 
-struct kinfo_proc_chain
-{
-	struct kinfo_proc_chain* next;
-	struct kinfo_proc kinfo;
-};
+static bool fill_proc(const char* name, int what, int flag, struct kinfo_proc* kinfo);
 
-static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag);
-static void free_chain(struct kinfo_proc_chain* chain);
-
-extern void free(void* ptr);
-extern void* malloc(__SIZE_TYPE__ len);
 extern __SIZE_TYPE__ strlen(const char* ptr);
 extern char* strcpy(char* dst, const char* src);
 extern void* memset(void*, int, __SIZE_TYPE__);
@@ -46,12 +37,14 @@ int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* bufl
 	char dents[256];
 	long basep = 0;
 	int nproc = 0;
-	struct kinfo_proc_chain *first = NULL, *last = NULL;
+	unsigned long max_out;
 
 	if (buflen == NULL)
 		return -EFAULT;
 	if (*buflen > 0 && out == NULL)
 		return -EFAULT;
+
+	max_out = *buflen / sizeof(struct kinfo_proc);
 
 	fd = sys_open_nocancel("/proc", BSD_O_RDONLY | BSD_O_DIRECTORY, 0);
 	if (fd < 0)
@@ -64,7 +57,7 @@ int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* bufl
 		while (pos < ret)
 		{
 			struct bsd_dirent* dent = (struct bsd_dirent*) &dents[pos];
-			struct kinfo_proc_chain* cur;
+			struct kinfo_proc kinfo;
 			// __simple_printf("Looking at %s\n", dent->d_name);
 
 			if (dent->d_type != DT_DIR || !isdigit(dent->d_name[0]))
@@ -76,18 +69,11 @@ int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* bufl
 			// Avoid loading process info unless really needed
 			if (what != KERN_PROC_ALL || *buflen > 0)
 			{
-				cur = load_proc(dent->d_name, what, flag);
-
-				if (cur != NULL)
+				if (fill_proc(dent->d_name, what, flag, &kinfo))
 				{
+					if (out != NULL && (unsigned long)nproc < max_out)
+						memcpy(&out[nproc], &kinfo, sizeof(kinfo));
 					nproc++;
-
-					if (first == NULL)
-						first = cur;
-					if (last != NULL)
-						last->next = cur;
-					cur->next = NULL;
-					last = cur;
 				}
 			}
 			else
@@ -104,20 +90,10 @@ int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* bufl
 	}
 	else
 	{
-		struct kinfo_proc_chain *next;
-		int i;
-
 		*buflen = nproc*sizeof(struct kinfo_proc);
-
-		next = first;
-		for (i = 0; next != NULL; i++)
-		{
-			memcpy(&out[i], &next->kinfo, sizeof(struct kinfo_proc));
-			next = next->next;
-		}
+		ret = 0;
 	}
 
-	free_chain(first);
 	close_internal(fd);
 
 	// __simple_printf("sysctl_proc returning %d, len %d\n", ret, *buflen);
@@ -182,69 +158,67 @@ void skip_stat_elems(char** buf, int count)
 		next_stat_elem(buf);
 }
 
-static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
+static bool fill_proc(const char* name, int what, int flag, struct kinfo_proc* kinfo)
 {
 	char path[56];
 	char stat[1024];
 	char *statptr;
 	const char* elem;
-	struct kinfo_proc_chain* kinfo;
 	static int uid = -1, gid = -1;
 
 	__simple_sprintf(path, "/proc/%s/stat", name);
 
-	kinfo = (struct kinfo_proc_chain*) malloc(sizeof(*kinfo));
 	memset(kinfo, 0, sizeof(*kinfo));
 
-	kinfo->kinfo.kp_proc.p_pid = __simple_atoi(name, NULL);
+	kinfo->kp_proc.p_pid = __simple_atoi(name, NULL);
 
 	bool is_64_bit;
-	if (dserver_rpc_task_is_64_bit(kinfo->kinfo.kp_proc.p_pid, &is_64_bit) < 0) {
+	if (dserver_rpc_task_is_64_bit(kinfo->kp_proc.p_pid, &is_64_bit) < 0) {
 		is_64_bit = false;
 	}
 	if (is_64_bit)
-		kinfo->kinfo.kp_proc.p_flag |= P_LP64;
+		kinfo->kp_proc.p_flag |= P_LP64;
 
 	if (!read_string(path, stat, sizeof(stat)))
-		goto retnull;
+		return false;
 
 	statptr = stat;
 	skip_stat_elems(&statptr, 1); // skip pid
 
-#define READELEM() elem = next_stat_elem(&statptr); if (!elem) goto retnull
+#define READELEM() elem = next_stat_elem(&statptr); if (!elem) return false
 
 	// comm
 	READELEM();
-	strncpy(kinfo->kinfo.kp_proc.p_comm, elem, sizeof(kinfo->kinfo.kp_proc.p_comm));
+	strncpy(kinfo->kp_proc.p_comm, elem, sizeof(kinfo->kp_proc.p_comm));
 
 	// process state
 	READELEM();
 	switch (*elem)
 	{
 		case 'R':
-			kinfo->kinfo.kp_proc.p_stat = SRUN;
+			kinfo->kp_proc.p_stat = SRUN;
 			break;
 		case 'S':
 		case 'D':
-			kinfo->kinfo.kp_proc.p_stat = SSLEEP;
+			kinfo->kp_proc.p_stat = SSLEEP;
 			break;
 		case 'T':
-			kinfo->kinfo.kp_proc.p_stat = SSTOP;
+			kinfo->kp_proc.p_stat = SSTOP;
 			break;
 		case 'Z':
-			kinfo->kinfo.kp_proc.p_stat = SZOMB;
+			kinfo->kp_proc.p_stat = SZOMB;
 			break;
 		default:
-			kinfo->kinfo.kp_proc.p_stat = SSLEEP;
+			kinfo->kp_proc.p_stat = SSLEEP;
 	}
 
 	// ppid
 	READELEM();
-	kinfo->kinfo.kp_eproc.e_ppid = __simple_atoi(elem, NULL);
+	kinfo->kp_eproc.e_ppid = __simple_atoi(elem, NULL);
 
 	// pgid
 	READELEM();
-	kinfo->kinfo.kp_eproc.e_pgid = __simple_atoi(elem, NULL);
+	kinfo->kp_eproc.e_pgid = __simple_atoi(elem, NULL);
 
 	// sid
 	READELEM();
@@ -252,22 +226,22 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 	{
 		int sid = __simple_atoi(elem, NULL);
 		if (sid != flag)
-			goto retnull;
+			return false;
 	}
 
 	// tty_nr
 	READELEM();
-	kinfo->kinfo.kp_eproc.e_tdev = __simple_atoi(elem, NULL);
-	if (kinfo->kinfo.kp_eproc.e_tdev != 0)
-		kinfo->kinfo.kp_proc.p_flag |= P_CONTROLT;
+	kinfo->kp_eproc.e_tdev = __simple_atoi(elem, NULL);
+	if (kinfo->kp_eproc.e_tdev != 0)
+		kinfo->kp_proc.p_flag |= P_CONTROLT;
 
 	skip_stat_elems(&statptr, NULL);
 
 	READELEM();
-	kinfo->kinfo.kp_proc.p_priority = __simple_atoi(elem, NULL);
+	kinfo->kp_proc.p_priority = __simple_atoi(elem, NULL);
 
 	READELEM();
-	kinfo->kinfo.kp_proc.p_nice = __simple_atoi(elem, NULL);
+	kinfo->kp_proc.p_nice = __simple_atoi(elem, NULL);
 
 	// In the container, everything is owned by us
 	if (uid == -1 || gid == -1)
@@ -276,31 +250,31 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 		gid = sys_getgid();
 	}
 
-	kinfo->kinfo.kp_eproc.e_pcred.p_ruid = uid;
-	kinfo->kinfo.kp_eproc.e_pcred.p_svuid = uid;
-	kinfo->kinfo.kp_eproc.e_pcred.p_rgid = gid;
-	kinfo->kinfo.kp_eproc.e_pcred.p_svgid = gid;
-	kinfo->kinfo.kp_eproc.e_ucred.cr_uid = uid;
+	kinfo->kp_eproc.e_pcred.p_ruid = uid;
+	kinfo->kp_eproc.e_pcred.p_svuid = uid;
+	kinfo->kp_eproc.e_pcred.p_rgid = gid;
+	kinfo->kp_eproc.e_pcred.p_svgid = gid;
+	kinfo->kp_eproc.e_ucred.cr_uid = uid;
 
 	switch (what)
 	{
 		case KERN_PROC_ALL:
 			break;
 		case KERN_PROC_PID:
-			if (flag != kinfo->kinfo.kp_proc.p_pid)
-				goto retnull;
+			if (flag != kinfo->kp_proc.p_pid)
+				return false;
 			break;
 		case KERN_PROC_TTY:
-			if (flag != kinfo->kinfo.kp_eproc.e_tdev)
-				goto retnull;
+			if (flag != kinfo->kp_eproc.e_tdev)
+				return false;
 			break;
 		case KERN_PROC_UID:
-			if (flag != kinfo->kinfo.kp_eproc.e_ucred.cr_uid)
-				goto retnull;
+			if (flag != kinfo->kp_eproc.e_ucred.cr_uid)
+				return false;
 			break;
 		case KERN_PROC_PGRP:
-			if (flag != kinfo->kinfo.kp_eproc.e_pgid)
-				goto retnull;
+			if (flag != kinfo->kp_eproc.e_pgid)
+				return false;
 			break;
 		case KERN_PROC_SESSION:
 			// Not present in the struct
@@ -308,31 +282,16 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 			// -> Evaluated above
 			break;
 		case KERN_PROC_RUID:
-			if (flag != kinfo->kinfo.kp_eproc.e_pcred.p_ruid)
-				goto retnull;
+			if (flag != kinfo->kp_eproc.e_pcred.p_ruid)
+				return false;
 			break;
 		case KERN_PROC_LCID:
 			break;
 		default:
-			goto retnull;
+			return false;
 	}
 
-	return kinfo;
-retnull:
-	free(kinfo);
-	return NULL;
-}
-
-static void free_chain(struct kinfo_proc_chain* chain)
-{
-	struct kinfo_proc_chain* next = chain;
-
-	while (chain != NULL)
-	{
-		next = chain->next;
-		free(chain);
-		chain = next;
-	}
+	return true;
 }
 
 int _sysctl_procargs(int pid, char* buf, unsigned long* buflen)

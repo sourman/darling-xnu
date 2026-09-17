@@ -42,14 +42,13 @@ const struct known_sysctl sysctls_root = {
 
 void copyout_string(const char* str, char* out, unsigned long* out_len)
 {
-	unsigned long len;
-	if (out != NULL)
-		len = strlcpy(out, str, *out_len);
-	else
-		len = strlen(str);
-
+	/* Apple string sysctls report length including the trailing NUL.
+	   Chromium (and others) subtract 1, then require that last byte to be 0. */
+	unsigned long needed = strlen(str) + 1;
+	if (out != NULL && out_len != NULL)
+		strlcpy(out, str, *out_len);
 	if (out_len != NULL)
-		*out_len = len;
+		*out_len = needed;
 }
 
 long sys_sysctl(int* name, unsigned int nlen, void* old,

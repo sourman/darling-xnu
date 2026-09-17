@@ -76,6 +76,9 @@ struct linux_sockaddr_un {
 #define dserver_rpc_hooks_memcpy memcpy
 
 static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hooks_msghdr_t* message) {
+	if (socket < 0) {
+		return -LINUX_EBADF;
+	}
 #ifdef __NR_socketcall
 	return LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_SENDMSG, ((long[6]) { socket, message, 0 }));
 #else
@@ -85,6 +88,10 @@ static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hoo
 
 static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_msghdr_t* out_message) {
 	long int ret = 0;
+
+	if (socket < 0) {
+		return -LINUX_EBADF;
+	}
 
 retry:
 #ifdef __NR_socketcall
@@ -280,16 +287,24 @@ __attribute__((format(printf, 1, 2)))
 void __dserver_rpc_hooks_printf(const char* format, ...);
 #define dserver_rpc_hooks_printf __dserver_rpc_hooks_printf
 
-#define dserver_rpc_hooks_atomic_save_t sigset_t
+#ifndef SIGNAL_SIGEXC_SUSPEND
+#define SIGNAL_SIGEXC_SUSPEND LINUX_SIGRTMIN
+#endif
+#ifndef SIGNAL_S2C
+#define SIGNAL_S2C (LINUX_SIGRTMIN + 1)
+#endif
+
+#define dserver_rpc_hooks_atomic_save_t linux_sigset_t
 
 static void dserver_rpc_hooks_atomic_begin(dserver_rpc_hooks_atomic_save_t* atomic_save) {
-	// block standard unix signals (not real-time signals, though)
-	sigset_t set = 0x7fffffff;
-	sys_sigprocmask(SIG_BLOCK, &set, atomic_save);
+	linux_sigset_t set = 0x7fffffffull
+		| (1ull << (SIGNAL_SIGEXC_SUSPEND - 1))
+		| (1ull << (SIGNAL_S2C - 1));
+	LINUX_SYSCALL(__NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &set, atomic_save, sizeof(linux_sigset_t));
 };
 
 static void dserver_rpc_hooks_atomic_end(dserver_rpc_hooks_atomic_save_t* atomic_save) {
-	sys_sigprocmask(SIG_SETMASK, atomic_save, NULL);
+	LINUX_SYSCALL(__NR_rt_sigprocmask, 2 /* SIG_SETMASK */, atomic_save, NULL, sizeof(linux_sigset_t));
 };
 
 #define dserver_rpc_hooks_get_interrupt_status() (-LINUX_EINTR)

@@ -115,7 +115,12 @@ int lkm_call_raw(int call_nr, void* arg)
 
 VISIBLE
 int mach_driver_get_fd(void) {
-	return __dserver_per_thread_socket();
+	int fd = __dserver_per_thread_socket();
+	if (fd < 0) {
+		__dserver_per_thread_socket_refresh();
+		fd = __dserver_per_thread_socket();
+	}
+	return fd;
 };
 
 VISIBLE

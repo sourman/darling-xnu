@@ -33,8 +33,12 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchdir.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/fcntl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/dirent/getdirentries.h>
+#include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
+#include <darling/emulation/common/guarded/table.h>
 
 #include <darlingserver/rpc.h>
+#include <mach/mach.h>
+#include <mach/task_special_ports.h>
 
 #ifndef _POSIX_SPAWN_DISABLE_ASLR
 #define _POSIX_SPAWN_DISABLE_ASLR 0x0100
@@ -49,6 +53,11 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 {
 	int ret, my_pid;
 	int pipe[2] = { -1, -1 };
+	unsigned int spawn_flags = (desc && desc->attrp) ? desc->attrp->psa_flags : 0;
+
+	__simple_kprintf("posix_spawn_v1 path=%s flags=0x%x fact=%d\n",
+		path ? path : "(null)", spawn_flags,
+		(desc && desc->factp) ? (int)desc->factp->psfa_act_count : 0);
 
 	if (desc && desc->attrp && desc->attrp->psa_flags & POSIX_SPAWN_SETEXEC)
 		goto no_fork;
@@ -110,12 +119,17 @@ no_fork:
 			}
 
 			if (desc->attrp->psa_flags & POSIX_SPAWN_CLOEXEC_DEFAULT) {
-				// set O_CLOEXEC on everything
-				int dir = sys_open("/proc/self/fd", BSD_O_RDONLY, 0);
+				// Linux /proc/self/fd, not the vchrooted Darwin path
+				// (guest sys_open("/proc/self/fd") is ENOENT on this overlay).
+				int dir = LINUX_SYSCALL(__NR_open, "/proc/self/fd",
+					LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_CLOEXEC, 0);
 				char buf[4096];
 				int len = 0;
+				int rpc_fd = __dserver_per_thread_socket();
+				int life_fd = __dserver_get_process_lifetime_pipe();
 
-				//__simple_kprintf("asked for cloexec default\n");
+				__simple_kprintf("posix_spawn_v1 cloexec_default linux_open dir=%d rpc=%d life=%d pipe=%d,%d\n",
+					dir, rpc_fd, life_fd, pipe[0], pipe[1]);
 
 				if (dir < 0) {
 					ret = dir;
@@ -137,6 +151,14 @@ no_fork:
 						// FIXME: pretty sure this should not be hardcoded
 						if (fd == 1023) {
 							// special commpage fd
+							continue;
+						}
+						if (fd == rpc_fd || fd == life_fd || fd == pipe[0] || fd == pipe[1] || fd == dir) {
+							continue;
+						}
+						/* Darling RPC / lifetime / thread sockets: CLOEXEC would
+						 * drop them across exec of mldr and SIGTRAP the child. */
+						if (guard_table_check(fd, guard_flag_prevent_close)) {
 							continue;
 						}
 
@@ -304,6 +326,46 @@ no_fork:
 			//__simple_kprintf("act count (on finish): %d\n", desc->factp->psfa_act_count);
 		}
 
+		if (desc && desc->pactp && desc->port_actions_size >= 8) {
+			struct darling_ps_port_action {
+				int port_type;
+				unsigned int mask;
+				unsigned int new_port;
+				int behavior;
+				int flavor;
+				int which;
+			};
+			struct darling_ps_port_actions {
+				int pspa_alloc;
+				int pspa_count;
+				struct darling_ps_port_action pspa_actions[];
+			};
+			const struct darling_ps_port_actions* ports = desc->pactp;
+			int n = ports->pspa_count;
+			int i;
+
+			__simple_kprintf("posix_spawn_v1 port_actions count=%d size=%lu\n",
+				n, (unsigned long)desc->port_actions_size);
+			if (n < 0 || n > 32)
+				n = 0;
+			for (i = 0; i < n; i++) {
+				const struct darling_ps_port_action* act = &ports->pspa_actions[i];
+				__simple_kprintf("posix_spawn_v1 port_action i=%d type=%d which=%d port=0x%x\n",
+					i, act->port_type, act->which, act->new_port);
+				/* PSPA_SPECIAL: set task special port (bootstrap is which=4). */
+				if (act->port_type == 0 && act->new_port) {
+					kern_return_t kr = task_set_special_port(mach_task_self(),
+						act->which, act->new_port);
+					__simple_kprintf("posix_spawn_v1 task_set_special_port which=%d port=0x%x kr=%d\n",
+						act->which, act->new_port, kr);
+					if (kr != 0) {
+						ret = kr;
+						goto fail;
+					}
+				}
+			}
+		}
+
 		char binprefs[64];
 		if (desc && desc->attrp && desc->attrp->psa_binprefs[0])
 		{
@@ -329,9 +391,17 @@ no_fork:
 			envp = new_envp;
 		}
 
+		{
+			mach_port_t bsp = 0;
+			kern_return_t bkr = task_get_special_port(mach_task_self(),
+				TASK_BOOTSTRAP_PORT, &bsp);
+			__simple_kprintf("posix_spawn_v1 child bootstrap kr=%d port=0x%x exec=%s\n",
+				bkr, bsp, path ? path : "(null)");
+		}
+		__simple_kprintf("posix_spawn_v1 child execve %s\n", path ? path : "(null)");
 		ret = sys_execve((char*) path, argvp, envp);
 fail:
-		//__simple_kprintf("posix_spawn is failing with %d\n", ret);
+		__simple_kprintf("posix_spawn_v1 child fail ret=%d path=%s\n", ret, path ? path : "(null)");
 		if (desc && desc->attrp && desc->attrp->psa_flags & POSIX_SPAWN_SETEXEC)
 		{
 			// no_fork case

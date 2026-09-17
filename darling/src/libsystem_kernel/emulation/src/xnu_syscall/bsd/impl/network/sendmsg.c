@@ -9,8 +9,6 @@
 #include <darling/emulation/xnu_syscall/bsd/helper/network/duct.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
 
-extern void *malloc(__SIZE_TYPE__ size);
-extern void free(void* ptr);
 extern void* memcpy(void* dest, const void* src, __SIZE_TYPE__ len);
 
 long sys_sendmsg(int socket, const struct bsd_msghdr* msg, int flags)
@@ -55,7 +53,7 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 
 		lmsg.msg_controllen = LINUX_CMSG_ALIGN(msg->msg_controllen + LINUX_BSD_CMSGHDR_SIZE_DIFFERENCE);
 
-		lchdr = (struct linux_cmsghdr*)malloc(lmsg.msg_controllen);
+		lchdr = (struct linux_cmsghdr*)__builtin_alloca(lmsg.msg_controllen);
 
 		lmsg.msg_control = lchdr;
 
@@ -85,9 +83,6 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
-
-	if (lchdr != NULL)
-		free(lchdr);
 
 	return ret;
 }

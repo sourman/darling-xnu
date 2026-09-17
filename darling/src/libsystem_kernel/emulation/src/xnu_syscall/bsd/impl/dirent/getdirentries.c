@@ -86,6 +86,8 @@ struct dirent64 __DARWIN_STRUCT_DIRENTRY;
 long sys_getdirentries64(int fd, char* ibuf, unsigned int len, long* basep)
 {
 	int ret, bpos = 0, opos = 0;
+	unsigned long long last_off = 0;
+	int consumed = 0;
 
 	unsigned int max_entry_count = len / BSD_DIRENT64_MIN_SIZE;
 
@@ -121,19 +123,22 @@ long sys_getdirentries64(int fd, char* ibuf, unsigned int len, long* basep)
 
 		bsd->d_reclen = sizeof(struct bsd_dirent64) + slen + 1;
 		bsd->d_namlen = slen;
-		bsd->d_seekoff = 0;
+		bsd->d_seekoff = l64->d_off;
 
 		round_to_4(&bsd->d_reclen);
 
 		opos += bsd->d_reclen;
 		bpos += l64->d_reclen;
+		last_off = l64->d_off;
+		consumed = 1;
 	}
 
-	/*
-	if (bpos < ret) {
-		__simple_printf("bpos < ret; %d < %d", bpos, ret);
-	}
-	*/
+	/* Linux getdents64 already advanced the fd. If we could not convert
+	 * every returned entry, rewind to the first unconsumed d_off so the
+	 * next call does not silently drop names (bundle Resources).
+	 * last_off==0 is not a safe cookie (would restart the directory). */
+	if (bpos < ret && consumed && last_off != 0)
+		LINUX_SYSCALL(__NR_lseek, fd, last_off, LINUX_SEEK_SET);
 
 	return opos;
 }

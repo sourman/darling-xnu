@@ -19,18 +19,34 @@ int sockaddr_fixup_from_bsd(struct sockaddr_fixup* out, const void* bsd_sockaddr
 	out->linux_family = sfamily_bsd_to_linux(out->bsd_family);
 
 	if (out->linux_family == LINUX_PF_LOCAL) {
-		struct vchroot_expand_args vc;
-		vc.flags = VCHROOT_FOLLOW;
-		vc.dfd = get_perthread_wd();
+		const char* p = out->sun_path;
+		int host_x11 = 0;
 
-		strcpy(vc.path, out->sun_path);
+		/* Abstract namespace sockets are already Linux paths. */
+		if (p[0] != '\0') {
+			if (__builtin_strncmp(p, "/private/tmp/.X11-unix/X", 24) == 0) {
+				__builtin_memmove(out->sun_path, out->sun_path + 8,
+						__builtin_strlen(out->sun_path + 8) + 1);
+				host_x11 = 1;
+			} else if (__builtin_strncmp(p, "/tmp/.X11-unix/X", 16) == 0) {
+				host_x11 = 1;
+			}
+		}
 
-		ret = vchroot_expand(&vc);
-		if (ret < 0)
-			return errno_linux_to_bsd(ret);
+		if (!host_x11 && p[0] != '\0') {
+			struct vchroot_expand_args vc;
+			vc.flags = VCHROOT_FOLLOW;
+			vc.dfd = get_perthread_wd();
 
-		strncpy(out->sun_path, vc.path, sizeof(out->sun_path) - 1);
-		out->sun_path[sizeof(out->sun_path) - 1] = '\0';
+			strcpy(vc.path, out->sun_path);
+
+			ret = vchroot_expand(&vc);
+			if (ret < 0)
+				return errno_linux_to_bsd(ret);
+
+			strncpy(out->sun_path, vc.path, sizeof(out->sun_path) - 1);
+			out->sun_path[sizeof(out->sun_path) - 1] = '\0';
+		}
 		ret = sizeof(*out) - sizeof(out->sun_path) + strlen(out->sun_path);
 	}
 

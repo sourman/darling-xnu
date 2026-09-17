@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/recvfrom.h>
 
 #include <stddef.h>
+#include <sys/errno.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -25,13 +26,16 @@ long sys_recvfrom_nocancel(int fd, void* buf, unsigned long len,
 	int ret, linux_flags;
 	struct sockaddr_fixup* fixed;
 
+	if (fd < 0)
+		return -EBADF;
+
 	linux_flags = msgflags_bsd_to_linux(flags);
 
 #ifdef __NR_socketcall
 	ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVFROM, ((long[6]) { fd, buf, len,
-			flags, from, socklen }));
+			linux_flags, from, socklen }));
 #else
-	ret = LINUX_SYSCALL(__NR_recvfrom, fd, buf, len, flags, from, socklen);
+	ret = LINUX_SYSCALL(__NR_recvfrom, fd, buf, len, linux_flags, from, socklen);
 #endif
 
 	if (ret < 0)

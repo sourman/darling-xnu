@@ -8,10 +8,10 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -nostdlib")
 
 add_definitions(-DBSDTHREAD_WRAP_LINUX_PTHREAD
 	-DEMULATED_SYSNAME="Darwin"
-	-DEMULATED_RELEASE="20.6.0"
-	-DEMULATED_VERSION="Darwin Kernel Version 20.6.0"
-	-DEMULATED_OSVERSION="20G1120"
-	-DEMULATED_OSPRODUCTVERSION="11.7.4"
+	-DEMULATED_RELEASE="22.6.0"
+	-DEMULATED_VERSION="Darwin Kernel Version 22.6.0"
+	-DEMULATED_OSVERSION="22G120"
+	-DEMULATED_OSPRODUCTVERSION="13.6.7"
 )
 
 # include src/startup for rtsig.h
@@ -153,6 +153,7 @@ set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/impl/misc/getrlimit.c
 	src/xnu_syscall/bsd/impl/misc/getrusage.c
 	src/xnu_syscall/bsd/impl/misc/iopolicysys.c
+	src/xnu_syscall/bsd/impl/misc/mac_syscall.c
 	src/xnu_syscall/bsd/impl/misc/proc_info.c
 	src/xnu_syscall/bsd/impl/misc/ptrace.c
 	src/xnu_syscall/bsd/impl/misc/reboot.c

@@ -9,11 +9,42 @@
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/xnu_syscall/mach/impl/mach_traps.h>
-#include <darling/emulation/linux_premigration/ext/mremap.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/conversion/duct_errno.h>
+#include <darling/emulation/conversion/mman/duct_mman.h>
+#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 
 #include <darlingserver/rpc.h>
+
+/* Self-task VM: raw Linux mmap/munmap, never the process allocator. */
+static int linux_mmap_failed(void *p)
+{
+	return (unsigned long)p > (unsigned long)-4096UL;
+}
+
+static void *self_task_mmap(void *addr, unsigned long size, int prot, int linux_flags)
+{
+#ifdef __NR_mmap2
+	return (void *)LINUX_SYSCALL(__NR_mmap2, addr, size, prot, linux_flags, -1, 0);
+#else
+	return (void *)LINUX_SYSCALL(__NR_mmap, addr, size, prot, linux_flags, -1, 0);
+#endif
+}
+
+static int self_task_munmap(void *addr, unsigned long size)
+{
+	return (int)LINUX_SYSCALL(__NR_munmap, addr, size);
+}
+
+static int self_task_mprotect(void *addr, unsigned long size, int prot)
+{
+	return (int)LINUX_SYSCALL(__NR_mprotect, addr, size, prot);
+}
+
+/* Darwin user page size; match duct-tape mach_vm_protect rounding. */
+#define DARLING_PAGE_SIZE 4096ULL
+#define darling_trunc_page(x) ((x) & ~(DARLING_PAGE_SIZE - 1ULL))
+#define darling_round_page(x) darling_trunc_page((x) + (DARLING_PAGE_SIZE - 1ULL))
 
 #define UNIMPLEMENTED_TRAP() { char msg[] = "Called unimplemented Mach trap: "; write(2, msg, sizeof(msg)-1); write(2, __FUNCTION__, sizeof(__FUNCTION__)-1); write(2, "\n", 1); }
 
@@ -105,7 +136,7 @@ kern_return_t semaphore_signal_trap_impl(
 
 	if (code < 0) {
 		__simple_printf("semaphore_signal failed (internally): %d\n", code);
-		__simple_abort();
+		return KERN_FAILURE;
 	}
 
 	return code;
@@ -270,9 +301,9 @@ kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 			return KERN_SUCCESS;
 		}
 
-		ret = munmap((void*)address, size);
+		ret = self_task_munmap((void*)address, size);
 
-		if (ret == -1)
+		if (ret < 0)
 			return KERN_FAILURE;
 
 		return KERN_SUCCESS;
@@ -289,19 +320,33 @@ kern_return_t _kernelrpc_mach_vm_protect_trap_impl(
 {
 	int prot = 0;
 	int ret;
+	mach_vm_address_t start;
+	mach_vm_address_t end;
 
 	if (target != 0 && target != mach_task_self())
 		return MACH_SEND_INVALID_DEST;
 
-	if (new_protection & VM_PROT_READ)
-		prot |= PROT_READ;
-	if (new_protection & VM_PROT_WRITE)
-		prot |= PROT_WRITE;
-	if (new_protection & VM_PROT_EXECUTE)
-		prot |= PROT_EXEC;
+	if (address + size < address)
+		return KERN_INVALID_ARGUMENT;
 
-	ret = mprotect((void*)address, size, prot);
-	if (ret == -1)
+	if (size == (mach_vm_size_t)0)
+		return KERN_SUCCESS;
+
+	if (new_protection & VM_PROT_READ)
+		prot |= LINUX_PROT_READ;
+	if (new_protection & VM_PROT_WRITE)
+		prot |= LINUX_PROT_WRITE;
+	if (new_protection & VM_PROT_EXECUTE)
+		prot |= LINUX_PROT_EXEC;
+
+	/* Same rounding as duct-tape mach_vm_protect / XNU vm_map_protect.
+	 * Unaligned malloc_zone_t still needs trunc/round. */
+	start = darling_trunc_page(address);
+	end = darling_round_page(address + size);
+	size = end - start;
+
+	ret = self_task_mprotect((void*)start, (unsigned long)size, prot);
+	if (ret < 0)
 		return KERN_FAILURE;
 
 	return KERN_SUCCESS;
@@ -322,50 +367,79 @@ kern_return_t _kernelrpc_mach_vm_map_trap_impl(
 
 	void* addr;
 	int prot = 0;
-	int posix_flags = MAP_ANON | MAP_PRIVATE;
+	int linux_flags = LINUX_MAP_ANONYMOUS | LINUX_MAP_PRIVATE;
 
 	if (cur_protection & VM_PROT_READ)
-		prot |= PROT_READ;
+		prot |= LINUX_PROT_READ;
 	if (cur_protection & VM_PROT_WRITE)
-		prot |= PROT_WRITE;
+		prot |= LINUX_PROT_WRITE;
 	if (cur_protection & VM_PROT_EXECUTE)
-		prot |= PROT_EXEC;
+		prot |= LINUX_PROT_EXEC;
 
-	if (!(flags & VM_FLAGS_ANYWHERE))
-		posix_flags |= MAP_FIXED;
+	if (!(flags & VM_FLAGS_ANYWHERE)) {
+		if (flags & VM_FLAGS_OVERWRITE)
+			linux_flags |= LINUX_MAP_FIXED;
+		else
+			linux_flags |= LINUX_MAP_FIXED_NOREPLACE;
+	}
 	if ((flags >> 24) == VM_MEMORY_REALLOC)
-		addr = (void*)__linux_mremap(((char*)*address) - 0x1000, 0x1000, 0x1000 + size, 0, NULL);
+		addr = (void*)LINUX_SYSCALL(__NR_mremap, ((char*)*address) - 0x1000, 0x1000, 0x1000 + size, 0, NULL);
 	else
-		addr = mmap((void*)*address, size, prot, posix_flags, -1, 0);
-	
-	if (addr == MAP_FAILED)
+		addr = self_task_mmap((void*)*address, size, prot, linux_flags);
+
+	if (linux_mmap_failed(addr))
 	{
 		return KERN_FAILURE;
 	}
-	
-	if (mask && ( ((uintptr_t)addr) & mask) != 0)
+
+	/*
+	 * Same layout as dtape_map_memfd_aligned: if the first try misses the
+	 * mask, unmap it, over-map, MAP_FIXED|overwrite at aligned q for
+	 * exactly `size` (one VMA), then drop prefix/suffix. Do not punch
+	 * holes inside [q, q+size). FIXED maps keep the first try. mask==0
+	 * and already-aligned ANYWHERE maps return as-is (hint is not FIXED).
+	 */
+	if (mask && (((uintptr_t)addr) & mask) != 0)
 	{
-		uintptr_t boundary, q, diff, iaddr;
-		
-		// Alignment was requested, but we couldn't get it the easy way
-		munmap(addr, size);
-		
-		// This may not work for some crazy masks. Consider using __builtin_clz().
-		boundary = mask + 1;
-		
-		iaddr = (uintptr_t)mmap((void*)*address, size + boundary, prot, posix_flags, -1, 0);
-		if (iaddr == (uintptr_t) MAP_FAILED)
+		uintptr_t boundary, q, diff, iaddr, over_size;
+		void *mapped;
+		int over_flags = linux_flags;
+
+		if (!(flags & VM_FLAGS_ANYWHERE))
+		{
+			*address = (uintptr_t)addr;
+			return KERN_SUCCESS;
+		}
+
+		self_task_munmap(addr, size);
+
+		boundary = (uintptr_t)mask + 1;
+		if (boundary == 0 || (size > ~(mach_vm_size_t)0 - boundary))
+			return KERN_NO_SPACE;
+
+		over_size = (uintptr_t)size + boundary;
+		over_flags &= ~LINUX_MAP_FIXED;
+
+		iaddr = (uintptr_t)self_task_mmap((void*)*address, over_size, prot, over_flags);
+		if (linux_mmap_failed((void*)iaddr))
 			return KERN_FAILURE;
-		
-		q = (iaddr + (boundary-1)) / boundary * boundary;
+
+		q = (iaddr + (boundary - 1)) / boundary * boundary;
 		diff = q - iaddr;
-		
+
+		mapped = self_task_mmap((void*)q, size, prot, over_flags | LINUX_MAP_FIXED);
+		if (linux_mmap_failed(mapped) || mapped != (void*)q)
+		{
+			self_task_munmap((void*)iaddr, over_size);
+			return KERN_NO_SPACE;
+		}
+
 		if (diff > 0)
-			munmap((void*)iaddr, diff);
+			self_task_munmap((void*)iaddr, diff);
 		if (boundary - diff > 0)
-			munmap((void*) (q + size), boundary - diff);
-		
-		addr = (void*) q;
+			self_task_munmap((void*)(q + size), boundary - diff);
+
+		addr = mapped;
 	}
 
 	*address = (uintptr_t)addr;

@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/recvmsg.h>
 
 #include <stddef.h>
+#include <sys/errno.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -11,8 +12,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/getsockopt.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
 
-extern void *malloc(__SIZE_TYPE__ size);
-extern void free(void* ptr);
 extern void* memcpy(void* dest, const void* src, __SIZE_TYPE__ len);
 
 #define ALIGN(what, how) ( ((what) + (how) - 1) & ~((how) - 1) )
@@ -43,7 +42,7 @@ long sys_recvmsg_nocancel(int socket, struct bsd_msghdr* msg, int flags)
 	{
 		// __simple_printf("controllen=%d\n", msg->msg_controllen);
 		lmsg.msg_controllen = LINUX_CMSG_ALIGN(msg->msg_controllen + LINUX_BSD_CMSGHDR_SIZE_DIFFERENCE); // FIXME: there could be multiple control messages in a message
-		lchdr = (struct linux_cmsghdr*) malloc(lmsg.msg_controllen);
+		lchdr = (struct linux_cmsghdr*) __builtin_alloca(lmsg.msg_controllen);
 		lmsg.msg_control = lchdr;
 	}
 	else
@@ -53,6 +52,9 @@ long sys_recvmsg_nocancel(int socket, struct bsd_msghdr* msg, int flags)
 	}
 
 	lmsg.msg_flags = 0; // set on return
+
+	if (socket < 0)
+		return -EBADF;
 
 	linux_flags = msgflags_bsd_to_linux(flags);
 
@@ -115,9 +117,6 @@ long sys_recvmsg_nocancel(int socket, struct bsd_msghdr* msg, int flags)
 			saddr->bsd_family = sfamily_linux_to_bsd(saddr->linux_family);
 		msg->msg_namelen = lmsg.msg_namelen;
 	}
-
-	if (lchdr != NULL)
-		free(lchdr);
 
 	// __simple_printf("Returning %d\n", ret);
 	return ret;

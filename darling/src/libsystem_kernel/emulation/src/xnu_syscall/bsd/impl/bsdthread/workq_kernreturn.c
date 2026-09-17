@@ -84,8 +84,17 @@ struct timespec
 	long tv_nsec;
 };
 
-void __attribute__((weak)) os_unfair_lock_unlock(os_unfair_lock_t lock) {}
-void __attribute__((weak)) os_unfair_lock_lock(os_unfair_lock_t lock) {}
+/*
+ * Do not define OS_EXPORT os_unfair_lock_{un,}lock here. A weak default
+ * export from libsystem_kernel interposes libsystem_platform, so Chrome's
+ * Random32 unlock is a no-op and the next take hits Apple's recursive abort.
+ */
+static void kernel_unfair_unlock(os_unfair_lock_t lock) { (void)lock; }
+static void kernel_unfair_lock(os_unfair_lock_t lock) { (void)lock; }
+#undef os_unfair_lock_unlock
+#undef os_unfair_lock_lock
+#define os_unfair_lock_unlock kernel_unfair_unlock
+#define os_unfair_lock_lock kernel_unfair_lock
 
 //void* __attribute__((weak)) __attribute__((visibility("default"))) pthread_getspecific(unsigned long key) { return NULL; }
 //int __attribute__((weak)) __attribute__((visibility("default"))) pthread_setspecific(unsigned long key, const void* value) { return 1; }

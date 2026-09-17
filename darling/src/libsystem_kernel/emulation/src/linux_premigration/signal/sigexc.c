@@ -14,6 +14,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/kill.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/conversion/fcntl/open.h>
 
 #include <darlingserver/rpc.h>
 
@@ -61,7 +62,7 @@ static void float_state_to_mcontext(const x86_float_state32_t* s, linux_fpregset
 static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, const void* fstate);
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate);
 
-#define DEBUG_SIGEXC
+/* Nested kern_printf on the RT stack overflows __simple_vsnprintf (~944B frame). */
 #ifdef DEBUG_SIGEXC
 #define kern_printf(...) __simple_kprintf(__VA_ARGS__)
 #else
@@ -291,6 +292,41 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 
 #ifdef __x86_64__
 	kern_printf("sigexc: have RIP 0x%llx\n", ctxt->uc_mcontext.gregs.rip);
+	if (linux_signum == LINUX_SIGTRAP || linux_signum == LINUX_SIGILL
+			|| linux_signum == LINUX_SIGABRT || linux_signum == LINUX_SIGBUS
+			|| linux_signum == LINUX_SIGSEGV) {
+		char buf[512];
+		unsigned long long rip = ctxt->uc_mcontext.gregs.rip;
+		unsigned char bytes[16];
+		int nbytes = 0;
+		int n;
+		int fd;
+		for (int i = 0; i < 16; i++) {
+			/* Best-effort: RIP is executable, so this should not fault. */
+			bytes[i] = ((unsigned char*)(unsigned long)rip)[i];
+			nbytes++;
+		}
+		n = __simple_snprintf(buf, sizeof(buf),
+			"CRASH sig=%d code=%d addr=%p rip=0x%llx rsp=0x%llx rbp=0x%llx rdi=0x%llx rsi=0x%llx rax=0x%llx bytes=%x %x %x %x %x %x %x %x\n",
+			linux_signum,
+			info ? info->si_code : -1,
+			info ? info->si_addr : (void*)0,
+			rip,
+			ctxt->uc_mcontext.gregs.rsp,
+			ctxt->uc_mcontext.gregs.rbp,
+			ctxt->uc_mcontext.gregs.rdi,
+			ctxt->uc_mcontext.gregs.rsi,
+			ctxt->uc_mcontext.gregs.rax,
+			(unsigned)bytes[0], (unsigned)bytes[1], (unsigned)bytes[2], (unsigned)bytes[3],
+			(unsigned)bytes[4], (unsigned)bytes[5], (unsigned)bytes[6], (unsigned)bytes[7]);
+		(void)nbytes;
+		fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+			LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+		if (fd >= 0) {
+			LINUX_SYSCALL3(__NR_write, fd, buf, n);
+			LINUX_SYSCALL1(__NR_close, fd);
+		}
+	}
 #endif
 
 	thread_t thread = mach_thread_self();

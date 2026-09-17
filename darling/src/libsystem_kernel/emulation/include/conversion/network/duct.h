@@ -43,9 +43,17 @@
 #define BSD_MSG_RCVMORE     0x4000
 #define BSD_MSG_NEEDSA      0x10000
 
+#define LINUX_SOCK_CLOEXEC    0x80000
+#define LINUX_SOCK_NONBLOCK   0x800
+
+#define BSD_SOCK_CLOEXEC      0x10000000
+#define BSD_SOCK_NOSIGPIPE    0x20000000
+#define BSD_SOCK_NONBLOCK     0x40000000
+
 int sfamily_linux_to_bsd(int family);
 int sfamily_bsd_to_linux(int family);
 int msgflags_bsd_to_linux(int flags);
 int msgflags_linux_to_bsd(int flags);
+int socket_type_bsd_to_linux(int type);
 
 #endif // DARLING_CONVERSION_NETWORK_DUCT

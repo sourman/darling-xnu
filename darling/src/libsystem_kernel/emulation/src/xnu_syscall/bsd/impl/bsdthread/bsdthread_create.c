@@ -43,6 +43,7 @@ static void rpc_unguard(int fd) {
 	guard_table_remove(fd);
 };
 
+/* mldr writes MACH_THREAD_SELF from thread_self_trap, then thread_set_tsd_base. */
 static const struct darling_thread_create_callbacks callbacks = {
 	.thread_self_trap = &thread_self_trap_impl,
 	.thread_set_tsd_base = &sys_thread_set_tsd_base,

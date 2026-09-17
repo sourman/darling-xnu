@@ -64,6 +64,7 @@
 
 #ifdef DARLING
 #include <darling/emulation/conversion/duct_errno.h>
+#include <darling/emulation/common/simple.h>
 #include <darlingserver/rpc.h>
 #endif
 
@@ -153,7 +154,8 @@ retry:
 		if (result == -LINUX_EINTR) {
 			goto retry;
 		}
-		__builtin_unreachable();
+		__simple_kprintf("_mach_fork_parent wait_for_child err=%d\n", result);
+		return result;
 	}
 	return 0;
 };

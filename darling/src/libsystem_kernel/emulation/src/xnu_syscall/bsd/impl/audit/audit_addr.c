@@ -20,6 +20,18 @@ static auditinfo_addr_t info = {
 // should be a rw lock but *shrug*
 static os_unfair_lock info_lock = OS_UNFAIR_LOCK_INIT;
 
+/*
+ * Do not define OS_EXPORT os_unfair_lock_{un,}lock in libsystem_kernel.
+ * A weak default export interposes libsystem_platform; Chrome's Random32
+ * unlock then becomes a no-op and the next take is Apple's recursive abort.
+ */
+static void kernel_unfair_unlock(os_unfair_lock_t lock) { (void)lock; }
+static void kernel_unfair_lock(os_unfair_lock_t lock) { (void)lock; }
+#undef os_unfair_lock_unlock
+#undef os_unfair_lock_lock
+#define os_unfair_lock_unlock kernel_unfair_unlock
+#define os_unfair_lock_lock kernel_unfair_lock
+
 long sys_getaudit_addr(struct auditinfo_addr* auditinfo_addr, int length) {
 	os_unfair_lock_lock(&info_lock);
 

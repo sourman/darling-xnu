@@ -83,3 +83,16 @@ int msgflags_linux_to_bsd(int flags)
 
 	return oflags;
 }
+
+int socket_type_bsd_to_linux(int type)
+{
+	int linux_type;
+
+	linux_type = type & ~(BSD_SOCK_CLOEXEC | BSD_SOCK_NOSIGPIPE | BSD_SOCK_NONBLOCK);
+	if (type & BSD_SOCK_CLOEXEC)
+		linux_type |= LINUX_SOCK_CLOEXEC;
+	if (type & BSD_SOCK_NONBLOCK)
+		linux_type |= LINUX_SOCK_NONBLOCK;
+
+	return linux_type;
+}

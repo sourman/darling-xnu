@@ -1,7 +1,10 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/listxattr.h>
 
+extern char* strcpy(char* dst, const char* src);
+
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
+#include <darling/emulation/conversion/xattr/name.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #include <darling/emulation/common/bsdthread/per_thread_wd.h>
@@ -28,7 +31,10 @@ long sys_listxattr(const char* path, char* namebuf, unsigned long size, int opti
 		ret = LINUX_SYSCALL(__NR_listxattr, path, namebuf, size);
 
 	if (ret < 0)
-		return errno_linux_to_bsd(ret);
+		return xattr_ret_linux_to_bsd(ret);
+
+	if (namebuf != NULL && size > 0)
+		ret = xattr_list_strip_user(namebuf, ret);
 
 	return ret;
 }

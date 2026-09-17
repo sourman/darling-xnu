@@ -4,6 +4,7 @@
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
+#include <darling/emulation/conversion/xattr/name.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/stat/common.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/fdpath.h>
@@ -48,7 +49,10 @@ long sys_flistxattr(int fd, char* namebuf, unsigned long size, int options)
 	}
 
 	if (ret < 0)
-		return errno_linux_to_bsd(ret);
+		return xattr_ret_linux_to_bsd(ret);
+
+	if (namebuf != NULL && size > 0)
+		ret = xattr_list_strip_user(namebuf, ret);
 
 	return ret;
 }

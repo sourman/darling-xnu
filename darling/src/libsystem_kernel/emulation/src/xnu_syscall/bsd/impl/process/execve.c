@@ -61,10 +61,17 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
-	char shebang[256];
+		char shebang[256];
 	int fd = sys_open(fname, BSD_O_RDONLY, 0);
-	if (fd < 0)
-		return fd;
+	if (fd < 0) {
+		/* After a successful vchroot expand, the Linux path may still be
+		 * openable when the Darwin-path open returns ENOENT (paths with
+		 * spaces in overlayfs). Probe the expanded path directly. */
+		int lfd = LINUX_SYSCALL(__NR_open, vc.path, LINUX_O_RDONLY, 0);
+		if (lfd < 0)
+			return fd;
+		fd = lfd;
+	}
 
 	ret = sys_read(fd, shebang, sizeof(shebang));
 	if (ret < 0)

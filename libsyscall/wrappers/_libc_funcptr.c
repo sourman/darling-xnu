@@ -36,6 +36,7 @@ __attribute__((visibility("hidden")))
 void *
 malloc(size_t size)
 {
+	/* Must not run on getentropy / mmap / dserver RPC hot paths. */
 	return _libkernel_functions->malloc(size);
 }
 

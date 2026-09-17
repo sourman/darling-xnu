@@ -29,8 +29,17 @@ static struct SavedRef g_savedRefs[200];
 static int g_nextSavedRef = 0, g_nextGen = 0;
 static os_unfair_lock g_savedRefLock = OS_UNFAIR_LOCK_INIT;
 
-void __attribute__((weak)) os_unfair_lock_unlock(os_unfair_lock_t lock) {}
-void __attribute__((weak)) os_unfair_lock_lock(os_unfair_lock_t lock) {}
+/*
+ * Do not define OS_EXPORT os_unfair_lock_{un,}lock here. A weak default
+ * export from libsystem_kernel interposes libsystem_platform, so Chrome's
+ * Random32 unlock is a no-op and the next take hits Apple's recursive abort.
+ */
+static void kernel_unfair_unlock(os_unfair_lock_t lock) { (void)lock; }
+static void kernel_unfair_lock(os_unfair_lock_t lock) { (void)lock; }
+#undef os_unfair_lock_unlock
+#undef os_unfair_lock_lock
+#define os_unfair_lock_unlock kernel_unfair_unlock
+#define os_unfair_lock_lock kernel_unfair_lock
 
 VISIBLE
 int sys_name_to_handle(const char* name, RefData* ref, int follow)

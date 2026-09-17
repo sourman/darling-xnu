@@ -7,6 +7,7 @@
 void sys_thread_set_tsd_base(void* ptr, int unk)
 {
 #ifdef __x86_64__
+	/* ptr is the child pthread TSD array, not the parent's. */
 	LINUX_SYSCALL(__NR_arch_prctl, ARCH_SET_GS, ptr);
 #elif defined(__i386__)
 	struct user_desc
