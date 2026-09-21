@@ -14,6 +14,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigprocmask.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 
 #include <darlingserver/rpc-supplement.h>
 
@@ -135,12 +136,51 @@ retry:
 						__simple_abort();
 					}
 
+					/*
+					 * Helpers only. XNU mach_vm_map OVERWRITE is a prot
+					 * change; Linux MAP_FIXED unmaps first (PA wipe).
+					 * Anonymous FIXED: NOREPLACE, then mprotect.
+					 * Never MAP_FIXED-fallback — that is the wipe.
+					 * Browser S2C still replaces (objc-cache / NativeWidget).
+					 */
+					if (darling_is_pa_helper() &&
+					    mmap_call->fd == -1 && mmap_call->address != 0 &&
+					    (mmap_call->flags & 0x10)) {
+						unsigned long nf = (mmap_call->flags & ~0x10UL) | 0x100000UL;
+#ifdef __NR_mmap2
+						call_ret = (void*)LINUX_SYSCALL(__NR_mmap2, mmap_call->address, mmap_call->length, mmap_call->protection, nf, -1, 0);
+#else
+						call_ret = (void*)LINUX_SYSCALL(__NR_mmap, mmap_call->address, mmap_call->length, mmap_call->protection, nf, -1, mmap_call->offset);
+#endif
+						if ((unsigned long)call_ret > (unsigned long)-4096 ||
+						    call_ret != mmap_call->address) {
+							if (mmap_call->protection != 0)
+								darling_zero_if_not_live(mmap_call->address,
+								    mmap_call->length);
+							long mp = darling_mprotect_inplace(mmap_call->address, mmap_call->length, mmap_call->protection);
+							if (mp == 0) {
+								call_ret = mmap_call->address;
+								if (mmap_call->protection == 0)
+									darling_page_state_note((unsigned long)mmap_call->address,
+									    mmap_call->length, DARLING_PS_RESERVED);
+								else
+									darling_page_state_note((unsigned long)mmap_call->address,
+									    mmap_call->length, DARLING_PS_FRESH);
+							}
+						}
+					} else {
 #ifdef __NR_mmap2
 					call_ret = (void*)LINUX_SYSCALL(__NR_mmap2, mmap_call->address, mmap_call->length, mmap_call->protection, mmap_call->flags, mmap_call->fd, mmap_call->offset / 4096);
 #else
 					call_ret = (void*)LINUX_SYSCALL(__NR_mmap, mmap_call->address, mmap_call->length, mmap_call->protection, mmap_call->flags, mmap_call->fd, mmap_call->offset);
 #endif
+					}
 
+					if (mmap_call->fd >= 0 &&
+					    (unsigned long)call_ret <= (unsigned long)-4096UL)
+						darling_pa_note_shadow_map((unsigned long)call_ret,
+						    (unsigned long)mmap_call->length,
+						    mmap_call->fd, (long)mmap_call->offset);
 					if (mmap_call->fd >= 0) {
 						close_internal(mmap_call->fd);
 					}
@@ -151,7 +191,23 @@ retry:
 						reply.address = (void*)(-1);
 					} else {
 						reply.address = call_ret;
+						darling_s2c_map_note((unsigned long)call_ret,
+						    (unsigned long)mmap_call->length);
 					}
+
+					darling_gpu_slot_log("s2c_mmap", (unsigned long)mmap_call->address,
+					    (unsigned long)mmap_call->length,
+					    (unsigned long)mmap_call->flags, (unsigned long)call_ret);
+					if (mmap_call->length == 0x800000000UL)
+						darling_log_mmap_prot((unsigned long)mmap_call->address,
+						    (unsigned long)mmap_call->length,
+						    (unsigned long)mmap_call->protection,
+						    (unsigned long)call_ret);
+					if ((unsigned long)call_ret < (unsigned long)-4096 &&
+					    call_ret != mmap_call->address)
+						darling_gpu_slot_log("s2c_mmap", (unsigned long)call_ret,
+						    (unsigned long)mmap_call->length,
+						    (unsigned long)mmap_call->flags, (unsigned long)call_ret);
 
 #ifdef __NR_socketcall
 					ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_SENDTO, ((long[6]) { socket, &reply, sizeof(reply), 0, dserver_rpc_hooks_get_server_address(), dserver_rpc_hooks_get_server_address_length() }));
@@ -176,7 +232,8 @@ retry:
 						.errno_result = 0,
 					};
 
-					call_ret = LINUX_SYSCALL2(__NR_munmap, munmap_call->address, munmap_call->length);
+					call_ret = darling_s2c_munmap((unsigned long)munmap_call->address,
+					    (unsigned long)munmap_call->length);
 
 					if (call_ret < 0) {
 						reply.return_value = -1;
@@ -208,7 +265,22 @@ retry:
 						.errno_result = 0,
 					};
 
-					call_ret = LINUX_SYSCALL3(__NR_mprotect, mprotect_call->address, mprotect_call->length, mprotect_call->protection);
+					if (mprotect_call->protection != 0)
+						darling_zero_if_not_live(mprotect_call->address,
+						    mprotect_call->length);
+					call_ret = darling_mprotect_inplace(mprotect_call->address, mprotect_call->length, mprotect_call->protection);
+					if (call_ret == 0) {
+						if (mprotect_call->protection == 0)
+							darling_page_state_note((unsigned long)mprotect_call->address,
+							    mprotect_call->length, DARLING_PS_RESERVED);
+						else
+							darling_page_state_note((unsigned long)mprotect_call->address,
+							    mprotect_call->length, DARLING_PS_FRESH);
+					}
+					darling_gpu_slot_log("s2c_mprotect", (unsigned long)mprotect_call->address,
+					    (unsigned long)mprotect_call->length,
+					    (unsigned long)mprotect_call->protection,
+					    (unsigned long)(unsigned int)call_ret);
 
 					if (call_ret < 0) {
 						reply.return_value = -1;
@@ -241,6 +313,10 @@ retry:
 					};
 
 					call_ret = LINUX_SYSCALL3(__NR_msync, msync_call->address, msync_call->size, msync_call->sync_flags);
+					darling_gpu_slot_log("s2c_msync", (unsigned long)msync_call->address,
+					    (unsigned long)msync_call->size,
+					    (unsigned long)msync_call->sync_flags,
+					    (unsigned long)(unsigned int)call_ret);
 
 					if (call_ret < 0) {
 						reply.return_value = -1;

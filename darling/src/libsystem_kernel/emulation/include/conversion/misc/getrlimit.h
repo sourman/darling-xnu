@@ -42,4 +42,21 @@ enum {
 
 unsigned int rlimit_bsd_to_linux(unsigned int which);
 
+/* Linux prlimit64 uses ~0ULL; Darwin RLIM_INFINITY is 2^63-1. Chromium
+ * getrlimit(RLIMIT_DATA) ImmediateCrash()s if rlim_cur has the sign bit. */
+#define LINUX_RLIM_INFINITY (~0ULL)
+#define BSD_RLIM_INFINITY   (0x7fffffffffffffffULL)
+
+static inline void rlim_linux_to_bsd(unsigned long long *v)
+{
+	if (*v == LINUX_RLIM_INFINITY)
+		*v = BSD_RLIM_INFINITY;
+}
+
+static inline void rlim_bsd_to_linux_val(unsigned long long *v)
+{
+	if (*v == BSD_RLIM_INFINITY)
+		*v = LINUX_RLIM_INFINITY;
+}
+
 #endif // DARLING_CONVERSION_MISC_GETRLIMIT

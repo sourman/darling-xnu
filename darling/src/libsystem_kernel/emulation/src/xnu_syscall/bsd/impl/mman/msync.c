@@ -1,4 +1,5 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/msync.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 
 #include <darling/emulation/conversion/mman/duct_mman.h>
 #include <darling/emulation/conversion/mman/msync.h>
@@ -32,6 +33,8 @@ long sys_msync_nocancel(void* addr, unsigned long len, int flags)
 	int ret;
 
 	ret = LINUX_SYSCALL(__NR_msync, addr, len, msync_flags_bsd_to_linux(flags));
+	darling_gpu_slot_log("msync", (unsigned long)addr, len,
+	    (unsigned long)(unsigned int)flags, (unsigned long)(unsigned int)ret);
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 

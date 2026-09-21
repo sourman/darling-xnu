@@ -13,6 +13,7 @@
 #include <darling/emulation/conversion/duct_errno.h>
 #include <darling/emulation/conversion/mman/duct_mman.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 
 #include <darlingserver/rpc.h>
 
@@ -22,29 +23,252 @@ static int linux_mmap_failed(void *p)
 	return (unsigned long)p > (unsigned long)-4096UL;
 }
 
+static int self_task_mprotect(void *addr, unsigned long size, int prot);
+__attribute__((used)) static const char dtape_mmap_commit_keep_v1[] = "mmap_commit_keep_v1";
+__attribute__((used)) static const char dtape_mmap_commit_keep_v3[] = "mmap_commit_keep_v3";
+__attribute__((used)) static const char dtape_gpu_map_fixed_log_v1[] = "gpu_map_fixed_log_v1";
+
+static void *self_task_mmap_raw(void *addr, unsigned long size, int prot, int linux_flags)
+{
+	void *mapped;
+
+#ifdef __NR_mmap2
+	mapped = (void *)LINUX_SYSCALL(__NR_mmap2, addr, size, prot, linux_flags, -1, 0);
+#else
+	mapped = (void *)LINUX_SYSCALL(__NR_mmap, addr, size, prot, linux_flags, -1, 0);
+#endif
+	darling_gpu_slot_log("vm_allocate", (unsigned long)addr, size,
+	    (unsigned long)linux_flags, (unsigned long)mapped);
+	if (size == 0x800000000UL)
+		darling_log_mmap_prot((unsigned long)addr, size,
+		    (unsigned long)(unsigned int)prot, (unsigned long)mapped);
+	return mapped;
+}
+
+/*
+ * VM_FLAGS_OVERWRITE on an existing anonymous reservation is a prot change
+ * on XNU. Linux MAP_FIXED unmaps first and drops encoded-next payload.
+ */
 static void *self_task_mmap(void *addr, unsigned long size, int prot, int linux_flags)
 {
-#ifdef __NR_mmap2
-	return (void *)LINUX_SYSCALL(__NR_mmap2, addr, size, prot, linux_flags, -1, 0);
-#else
-	return (void *)LINUX_SYSCALL(__NR_mmap, addr, size, prot, linux_flags, -1, 0);
-#endif
+	void *mapped;
+	int nr;
+	int probe_flags;
+	int log_gpu, cage_n = 0, contains = 0, mapped_pre = 0, resident = 0, kept = 0;
+
+	if ((linux_flags & (LINUX_MAP_FIXED | LINUX_MAP_FIXED_NOREPLACE)) &&
+	    darling_pa_cage_occupies_shadow((unsigned long)addr, size))
+		return (void *)(long)-LINUX_ENOMEM;
+
+	if (!(linux_flags & LINUX_MAP_FIXED) || addr == 0)
+		return self_task_mmap_raw(addr, size, prot, linux_flags);
+
+	log_gpu = darling_gpu_fixed_pre((unsigned long)addr, size,
+	    &cage_n, &contains, &mapped_pre, &resident);
+	/*
+	 * Darwin VM_FLAGS_OVERWRITE on a live anonymous mapping is a prot
+	 * change. Linux MAP_FIXED unmaps first. BSD mmap MAP_FIXED still
+	 * replaces (objc heap). This trap must not require an 8GiB cage.
+	 * Helpers in the PA probe range keep without mincore (early 0x108
+	 * PROT_NONE). Low-VA helper FIXED (0x1000) still replaces when
+	 * unmapped. Non-helpers keep only if already mapped (objc 0x7f).
+	 */
+	if (!(darling_is_pa_helper() &&
+	      !darling_in_malloc_heap((unsigned long)addr, size)) &&
+	    !darling_pa_range_mapped((unsigned long)addr, size)) {
+		mapped = self_task_mmap_raw(addr, size, prot, linux_flags);
+		darling_gpu_slot_log("vm_map", (unsigned long)addr, size,
+		    (unsigned long)linux_flags, (unsigned long)mapped);
+		if (log_gpu)
+			darling_gpu_fixed_post("vm_map", (unsigned long)addr, size, prot,
+			    cage_n, contains, mapped_pre, resident, mapped, 0);
+		return mapped;
+	}
+
+	(void)dtape_mmap_commit_keep_v1;
+	(void)dtape_mmap_commit_keep_v3;
+	(void)dtape_gpu_map_fixed_log_v1;
+	kept = 1;
+	probe_flags = (linux_flags & ~LINUX_MAP_FIXED) | LINUX_MAP_FIXED_NOREPLACE;
+	mapped = self_task_mmap_raw(addr, size, prot, probe_flags);
+	if (!linux_mmap_failed(mapped) && mapped == addr) {
+		darling_gpu_slot_log("vm_map", (unsigned long)addr, size,
+		    (unsigned long)linux_flags, (unsigned long)mapped);
+		if (log_gpu)
+			darling_gpu_fixed_post("vm_map", (unsigned long)addr, size, prot,
+			    cage_n, contains, mapped_pre, resident, mapped, kept);
+		return mapped;
+	}
+
+	nr = self_task_mprotect(addr, size, prot);
+	if (nr == 0) {
+		darling_gpu_slot_log("vm_map", (unsigned long)addr, size,
+		    (unsigned long)linux_flags, (unsigned long)addr);
+		if (log_gpu)
+			darling_gpu_fixed_post("vm_map", (unsigned long)addr, size, prot,
+			    cage_n, contains, mapped_pre, resident, addr, kept);
+		return addr;
+	}
+
+	/* Do not MAP_FIXED-fallback. That unmaps live payload. */
+	if (!linux_mmap_failed(mapped)) {
+		darling_gpu_slot_log("vm_map", (unsigned long)addr, size,
+		    (unsigned long)linux_flags, (unsigned long)mapped);
+		if (log_gpu)
+			darling_gpu_fixed_post("vm_map", (unsigned long)addr, size, prot,
+			    cage_n, contains, mapped_pre, resident, mapped, kept);
+		return mapped;
+	}
+	darling_gpu_slot_log("vm_map", (unsigned long)addr, size,
+	    (unsigned long)linux_flags, (unsigned long)(long)nr);
+	if (log_gpu)
+		darling_gpu_fixed_post("vm_map", (unsigned long)addr, size, prot,
+		    cage_n, contains, mapped_pre, resident, (void*)(long)nr, kept);
+	return (void*)(long)nr;
 }
 
 static int self_task_munmap(void *addr, unsigned long size)
 {
-	return (int)LINUX_SYSCALL(__NR_munmap, addr, size);
+	int ret;
+
+	ret = (int)LINUX_SYSCALL(__NR_munmap, addr, size);
+	darling_gpu_slot_log("munmap", (unsigned long)addr, size, 0,
+	    (unsigned long)(unsigned int)ret);
+	return ret;
 }
 
 static int self_task_mprotect(void *addr, unsigned long size, int prot)
 {
-	return (int)LINUX_SYSCALL(__NR_mprotect, addr, size, prot);
+	int ret;
+
+	if (prot != 0)
+		darling_zero_if_not_live(addr, size);
+	ret = darling_mprotect_inplace(addr, size, prot);
+	if (ret == 0 && prot != 0)
+		darling_pa_after_commit((unsigned long)addr, size);
+	if (ret == 0) {
+		if (prot == 0)
+			darling_page_state_note((unsigned long)addr, size,
+			    DARLING_PS_RESERVED);
+		else
+			darling_page_state_note((unsigned long)addr, size,
+			    DARLING_PS_FRESH);
+	}
+	darling_gpu_slot_log("vm_protect", (unsigned long)addr, size,
+	    (unsigned long)prot, (unsigned long)(unsigned int)ret);
+	return ret;
 }
 
 /* Darwin user page size; match duct-tape mach_vm_protect rounding. */
 #define DARLING_PAGE_SIZE 4096ULL
 #define darling_trunc_page(x) ((x) & ~(DARLING_PAGE_SIZE - 1ULL))
 #define darling_round_page(x) darling_trunc_page((x) + (DARLING_PAGE_SIZE - 1ULL))
+#define DARWIN_SUPERPAGE_SIZE  (2ULL * 1024ULL * 1024ULL)
+#define PA_PTR_TAG_ALIGN       (1ULL << 34)
+#define PA_CAGE_SLOP           (4ULL * DARWIN_SUPERPAGE_SIZE)
+#define LINUX_USER_END         (1ULL << 47)
+#define PA_PROBE_BASE          (1ULL << 40)
+#define PA_PROBE_SLOTS         96
+#define PA_SAFE_OVERMAP_END    (0x700000000000ULL)
+
+__attribute__((used)) static const char dtape_vm_map_pool_stride_v1[] = "vm_map_pool_stride_v1";
+__attribute__((used)) static const char dtape_vm_map_pool_stride_v2[] = "vm_map_pool_stride_v2";
+__attribute__((used)) static const char dtape_vm_map_pool_stride_v3[] = "vm_map_pool_stride_v3";
+__attribute__((used)) static const char dtape_vm_map_pool_stride_v4[] = "vm_map_pool_stride_v4";
+
+static int pa_is_cage_len_u(uintptr_t len)
+{
+	uintptr_t eight = PA_PTR_TAG_ALIGN / 2;
+	uintptr_t sixteen = PA_PTR_TAG_ALIGN;
+
+	if (len + PA_CAGE_SLOP >= eight && len <= eight + PA_CAGE_SLOP)
+		return 1;
+	if (len + PA_CAGE_SLOP >= sixteen && len <= sixteen + PA_CAGE_SLOP)
+		return 1;
+	return 0;
+}
+
+static uintptr_t pa_anon_align_u(uintptr_t len)
+{
+	uintptr_t a;
+
+	if (pa_is_cage_len_u(len))
+		return PA_PTR_TAG_ALIGN;
+	/* 32GiB over-map is not a cage. Same rule as pa_anon_align. */
+	if (len > PA_PTR_TAG_ALIGN)
+		return 0;
+	if (len < DARWIN_SUPERPAGE_SIZE || (len & (DARWIN_SUPERPAGE_SIZE - 1ULL)) != 0)
+		return 0;
+	a = DARWIN_SUPERPAGE_SIZE;
+	while ((a << 1) <= len && (a << 1) <= PA_PTR_TAG_ALIGN && (len & a) == 0)
+		a <<= 1;
+	return a;
+}
+
+static int pa_same_tag_bucket_u(uintptr_t addr, uintptr_t size)
+{
+	if (size == 0)
+		return 1;
+	if (addr + size < addr || addr + size > LINUX_USER_END)
+		return 0;
+	return (addr & ~(PA_PTR_TAG_ALIGN - 1ULL)) ==
+	    ((addr + size - 1ULL) & ~(PA_PTR_TAG_ALIGN - 1ULL));
+}
+
+static int pa_keep_aligned_u(uintptr_t addr, uintptr_t size, uintptr_t align)
+{
+	if ((addr & (align - 1ULL)) != 0)
+		return 0;
+	if (align < PA_PTR_TAG_ALIGN || size > PA_PTR_TAG_ALIGN)
+		return 1;
+	return pa_same_tag_bucket_u(addr, size);
+}
+
+static void *self_task_mmap_tag_probe(unsigned long size, int prot, int linux_flags, unsigned long align, unsigned long hint)
+{
+	unsigned long bases[3];
+	unsigned long h;
+	void *mapped;
+	int b, n;
+
+	if (darling_is_pa_helper() && hint != 0 &&
+	    darling_pa_range_mapped(hint, DARLING_PAGE_SIZE)) {
+		mapped = self_task_mmap((void*)hint, size, prot,
+		    linux_flags | LINUX_MAP_FIXED);
+		if (!linux_mmap_failed(mapped) && mapped == (void*)hint)
+			return mapped;
+	}
+
+	linux_flags &= ~LINUX_MAP_FIXED;
+	bases[0] = PA_PROBE_BASE;
+	bases[1] = align;
+	bases[2] = PA_PROBE_BASE + ((unsigned long)PA_PROBE_SLOTS * align);
+
+	for (b = 0; b < 3; b++) {
+		h = bases[b] & ~(align - 1UL);
+		if (h < align)
+			h = align;
+		for (n = 0; n < PA_PROBE_SLOTS; n++, h += align) {
+			if (h < align || size > LINUX_USER_END - h)
+				break;
+			if (align >= PA_PTR_TAG_ALIGN && size <= PA_PTR_TAG_ALIGN &&
+			    !pa_same_tag_bucket_u(h, size))
+				continue;
+			if (darling_pa_cage_occupies_shadow(h, size))
+				continue;
+			mapped = self_task_mmap((void*)h, size, prot,
+			    linux_flags | LINUX_MAP_FIXED_NOREPLACE);
+			if (!linux_mmap_failed(mapped) && mapped == (void*)h) {
+				darling_pa_cage_note((unsigned long)mapped, size);
+				return mapped;
+			}
+		}
+	}
+	return (void*)(long)-LINUX_ENOMEM;
+}
+
+__attribute__((used)) static const char dtape_named_entry_keep_page_v1[] =
+    "named_entry_keep_page_v1";
 
 #define UNIMPLEMENTED_TRAP() { char msg[] = "Called unimplemented Mach trap: "; write(2, msg, sizeof(msg)-1); write(2, __FUNCTION__, sizeof(__FUNCTION__)-1); write(2, "\n", 1); }
 
@@ -268,6 +492,8 @@ kern_return_t _kernelrpc_mach_vm_allocate_trap_impl(
 	}
 }
 
+__attribute__((used)) static const char dtape_named_entry_reuse_va_v1[] = "named_entry_reuse_va_v1";
+
 kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 				mach_port_name_t target,
 				mach_vm_address_t address,
@@ -289,6 +515,9 @@ kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 	}
 	else
 	{
+		mach_vm_address_t start;
+		mach_vm_address_t end;
+
 		// XNU returns KERN_INVALID_ARGUMENT for address overflow, 
 		// and allows NULL address if size is 0.
 		if (address + size < address)
@@ -298,6 +527,29 @@ kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 
 		if (size == (mach_vm_offset_t)0)
 		{
+			return KERN_SUCCESS;
+		}
+
+		/*
+		 * Self-task dealloc is a raw Linux munmap. It never reaches
+		 * dserver vm_map_remove, so the ≥128KB named-entry pin there
+		 * never ran. Chrome Map()s NodeLinkMemory at 0x7f0000001000
+		 * then the first Mapping destructor punches it before the
+		 * second map. AdoptFragment at 0x4c0 then hits a hollow page.
+		 * Keep ≥128KB maps in that window. 4K punches stay independent.
+		 * Do not RPC this (S2C munmap deadlocks the waiting thread).
+		 */
+		start = darling_trunc_page(address);
+		end = darling_round_page(address + size);
+		if (end > start &&
+		    end > 0x7f0000000000ULL && start < 0x7f8000000000ULL &&
+		    (end - start) >= 131072ULL)
+		{
+			(void)dtape_named_entry_reuse_va_v1;
+			(void)dtape_named_entry_keep_page_v1;
+			__simple_printf("named_entry_reuse_va_v1 keep_va=0x%lx size=%lu dealloc=0x%lx-0x%lx\n",
+			    (unsigned long)start, (unsigned long)(end - start),
+			    (unsigned long)start, (unsigned long)end);
 			return KERN_SUCCESS;
 		}
 
@@ -389,6 +641,10 @@ kern_return_t _kernelrpc_mach_vm_map_trap_impl(
 
 	if (linux_mmap_failed(addr))
 	{
+		long err = (long)addr;
+
+		if (err == -LINUX_EEXIST || err == -LINUX_ENOMEM)
+			return KERN_NO_SPACE;
 		return KERN_FAILURE;
 	}
 
@@ -396,53 +652,94 @@ kern_return_t _kernelrpc_mach_vm_map_trap_impl(
 	 * Same layout as dtape_map_memfd_aligned: if the first try misses the
 	 * mask, unmap it, over-map, MAP_FIXED|overwrite at aligned q for
 	 * exactly `size` (one VMA), then drop prefix/suffix. Do not punch
-	 * holes inside [q, q+size). FIXED maps keep the first try. mask==0
-	 * and already-aligned ANYWHERE maps return as-is (hint is not FIXED).
+	 * holes inside [q, q+size). FIXED maps keep the first try.
+	 * PartitionAlloc 8/16GiB pools need stride ≥ kPtrTagMask even when
+	 * the caller only passed a 2MiB mask (or mask==0 via mmap).
 	 */
-	if (mask && (((uintptr_t)addr) & mask) != 0)
+	if (flags & VM_FLAGS_ANYWHERE)
 	{
-		uintptr_t boundary, q, diff, iaddr, over_size;
-		void *mapped;
-		int over_flags = linux_flags;
-
-		if (!(flags & VM_FLAGS_ANYWHERE))
+		uintptr_t pa = pa_anon_align_u((uintptr_t)size);
+		uintptr_t need = mask ? ((uintptr_t)mask + 1) : 0;
+		if (pa > need)
+			need = pa;
+		if (need > 1 && !pa_keep_aligned_u((uintptr_t)addr, (uintptr_t)size, need))
 		{
-			*address = (uintptr_t)addr;
-			return KERN_SUCCESS;
+			uintptr_t boundary, q, diff, iaddr, over_size;
+			void *mapped;
+			int over_flags = linux_flags;
+
+			(void)dtape_vm_map_pool_stride_v1;
+			(void)dtape_vm_map_pool_stride_v2;
+			(void)dtape_vm_map_pool_stride_v3;
+			(void)dtape_vm_map_pool_stride_v4;
+			self_task_munmap(addr, size);
+
+			boundary = need;
+			over_flags = linux_flags;
+			over_flags &= ~LINUX_MAP_FIXED;
+
+			if (need >= (1UL << 30)) {
+				mapped = self_task_mmap_tag_probe((unsigned long)size, prot, over_flags, need,
+				    (unsigned long)*address);
+				if (!linux_mmap_failed(mapped)) {
+					addr = mapped;
+					goto pa_aligned_done;
+				}
+			}
+
+			if (boundary == 0 || (size > ~(mach_vm_size_t)0 - boundary))
+				return KERN_NO_SPACE;
+
+			over_size = (uintptr_t)size + boundary;
+
+			iaddr = (uintptr_t)self_task_mmap((void*)*address, over_size, prot, over_flags);
+			if (linux_mmap_failed((void*)iaddr)) {
+				mapped = self_task_mmap_tag_probe((unsigned long)size, prot, over_flags, need,
+				    (unsigned long)*address);
+				if (!linux_mmap_failed(mapped)) {
+					addr = mapped;
+					goto pa_aligned_done;
+				}
+				return KERN_FAILURE;
+			}
+
+			q = (iaddr + (boundary - 1)) / boundary * boundary;
+			diff = q - iaddr;
+
+			if (q < iaddr || q + (uintptr_t)size < q ||
+			    q + (uintptr_t)size > LINUX_USER_END ||
+			    q >= PA_SAFE_OVERMAP_END ||
+			    (need >= PA_PTR_TAG_ALIGN && (uintptr_t)size <= PA_PTR_TAG_ALIGN &&
+			     !pa_same_tag_bucket_u(q, (uintptr_t)size))) {
+				self_task_munmap((void*)iaddr, over_size);
+				mapped = self_task_mmap_tag_probe((unsigned long)size, prot, over_flags, need,
+				    (unsigned long)*address);
+				if (!linux_mmap_failed(mapped)) {
+					addr = mapped;
+					goto pa_aligned_done;
+				}
+				return KERN_NO_SPACE;
+			}
+
+			mapped = self_task_mmap((void*)q, size, prot, over_flags | LINUX_MAP_FIXED);
+			if (linux_mmap_failed(mapped) || mapped != (void*)q)
+			{
+				self_task_munmap((void*)iaddr, over_size);
+				return KERN_NO_SPACE;
+			}
+
+			if (diff > 0)
+				self_task_munmap((void*)iaddr, diff);
+			if (boundary - diff > 0)
+				self_task_munmap((void*)(q + size), boundary - diff);
+
+			addr = mapped;
 		}
-
-		self_task_munmap(addr, size);
-
-		boundary = (uintptr_t)mask + 1;
-		if (boundary == 0 || (size > ~(mach_vm_size_t)0 - boundary))
-			return KERN_NO_SPACE;
-
-		over_size = (uintptr_t)size + boundary;
-		over_flags &= ~LINUX_MAP_FIXED;
-
-		iaddr = (uintptr_t)self_task_mmap((void*)*address, over_size, prot, over_flags);
-		if (linux_mmap_failed((void*)iaddr))
-			return KERN_FAILURE;
-
-		q = (iaddr + (boundary - 1)) / boundary * boundary;
-		diff = q - iaddr;
-
-		mapped = self_task_mmap((void*)q, size, prot, over_flags | LINUX_MAP_FIXED);
-		if (linux_mmap_failed(mapped) || mapped != (void*)q)
-		{
-			self_task_munmap((void*)iaddr, over_size);
-			return KERN_NO_SPACE;
-		}
-
-		if (diff > 0)
-			self_task_munmap((void*)iaddr, diff);
-		if (boundary - diff > 0)
-			self_task_munmap((void*)(q + size), boundary - diff);
-
-		addr = mapped;
 	}
+pa_aligned_done:
 
 	*address = (uintptr_t)addr;
+	darling_pa_cage_note((unsigned long)addr, (unsigned long)size);
 	return KERN_SUCCESS;
 }
 
@@ -683,6 +980,28 @@ kern_return_t _kernelrpc_mach_port_get_attributes_impl(
 
 	if (code < 0) {
 		__simple_printf("mach_port_get_attributes failed (internally): %d\n", code);
+		__simple_abort();
+	}
+
+	return code;
+};
+
+kern_return_t _kernelrpc_mach_port_peek_impl(
+	mach_port_name_t target,
+	mach_port_name_t name,
+	mach_msg_trailer_type_t trailer_type,
+	mach_port_seqno_t* seqnop,
+	mach_msg_size_t* msg_sizep,
+	mach_msg_id_t* msg_idp,
+	mach_msg_trailer_info_t trailer_infop,
+	mach_msg_type_number_t* trailer_sizep
+)
+{
+	int code = dserver_rpc_mach_port_peek(target, name, trailer_type,
+	    seqnop, msg_sizep, msg_idp, trailer_infop, trailer_sizep);
+
+	if (code < 0) {
+		__simple_printf("mach_port_peek failed (internally): %d\n", code);
 		__simple_abort();
 	}
 

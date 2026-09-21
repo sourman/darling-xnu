@@ -12,6 +12,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigaltstack.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
+#include <darling/emulation/conversion/mman/duct_mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/kill.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/conversion/fcntl/open.h>
@@ -29,6 +30,17 @@ extern void sig_restorer(void);
 extern int getpid(void);
 
 extern _libkernel_functions_t _libkernel_functions;
+
+__attribute__((used)) const char sigexc_kill_self_v1[] = "sigexc_kill_self_v1";
+__attribute__((used)) const char sigexc_crash_pid_v1[] = "sigexc_crash_pid_v1";
+__attribute__((used)) const char sigexc_setnext_dump_v1[] = "sigexc_setnext_dump_v1";
+__attribute__((used)) const char sigexc_pa_pagein_v1[] = "sigexc_pa_pagein_v1";
+__attribute__((used)) const char sigexc_meta18_vis_v1[] = "sigexc_meta18_vis_v1";
+
+static int linux_self_pid(void)
+{
+	return (int)LINUX_SYSCALL0(__NR_getpid);
+}
 
 void darling_sigexc_uninstall(void);
 void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext* ctxt);
@@ -139,7 +151,7 @@ void sigexc_setup(void)
 		}
 		if (tracer != 0) {
 			kern_printf("sigexc: already traced -> SIGTRAP\n");
-			sys_kill(0, SIGTRAP, 0);
+			sys_kill(linux_self_pid(), SIGTRAP, 0);
 		}
 	}
 #else
@@ -292,10 +304,74 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 
 #ifdef __x86_64__
 	kern_printf("sigexc: have RIP 0x%llx\n", ctxt->uc_mcontext.gregs.rip);
+	/*
+	 * Darwin T_PAGE_FAULT calls vm_fault() and retries. Linux PROT_NONE
+	 * in a PA cage reservation SIGSEGVs instead. Occupancy is already
+	 * bumped for a full system-page of slots; the next SetNext is the
+	 * first store on the following 4K. Page-in that 4K (zeros) and
+	 * return so the store lands. Do not skip RIP. Alignment faults
+	 * (SIGBUS code 1) stay fatal.
+	 */
+	if ((linux_signum == LINUX_SIGSEGV || linux_signum == LINUX_SIGBUS) &&
+	    info != 0 && ctxt != 0) {
+		unsigned long fa = (unsigned long)info->si_addr;
+		int sc = info->si_code;
+		int do_pagein = 0;
+
+		(void)sigexc_pa_pagein_v1;
+		if (fa >= (1UL << 40)) {
+			if (linux_signum == LINUX_SIGSEGV &&
+			    (sc == 1 || sc == 2))
+				do_pagein = 1;
+			else if (linux_signum == LINUX_SIGBUS && sc != 1)
+				do_pagein = 1;
+		}
+		if (do_pagein) {
+			unsigned long page = fa & ~4095UL;
+			long nr;
+			char pbuf[192];
+			int pn, pfd;
+
+			nr = LINUX_SYSCALL3(__NR_mprotect, page, 4096UL,
+			    LINUX_PROT_READ | LINUX_PROT_WRITE);
+			if (nr != 0) {
+				void *mp;
+#ifdef __NR_mmap2
+				mp = (void *)LINUX_SYSCALL6(__NR_mmap2, page, 4096UL,
+				    LINUX_PROT_READ | LINUX_PROT_WRITE,
+				    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+				    -1, 0);
+#else
+				mp = (void *)LINUX_SYSCALL6(__NR_mmap, page, 4096UL,
+				    LINUX_PROT_READ | LINUX_PROT_WRITE,
+				    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+				    -1, 0);
+#endif
+				if ((unsigned long)mp == page)
+					nr = 0;
+			}
+			pn = __simple_snprintf(pbuf, sizeof(pbuf),
+			    "PAGEIN pid=%d sig=%d code=%d addr=0x%lx page=0x%lx nr=%ld\n",
+			    linux_self_pid(), linux_signum, sc, fa, page, nr);
+			if (pn > (int)sizeof(pbuf) - 1)
+				pn = (int)sizeof(pbuf) - 1;
+			__simple_printf("%s", pbuf);
+			pfd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+			    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+			if (pfd >= 0) {
+				LINUX_SYSCALL3(__NR_write, pfd, pbuf, pn);
+				LINUX_SYSCALL1(__NR_close, pfd);
+			}
+			if (nr == 0) {
+				darling_pa_twva_consider(page);
+				goto out;
+			}
+		}
+	}
 	if (linux_signum == LINUX_SIGTRAP || linux_signum == LINUX_SIGILL
 			|| linux_signum == LINUX_SIGABRT || linux_signum == LINUX_SIGBUS
 			|| linux_signum == LINUX_SIGSEGV) {
-		char buf[512];
+		char buf[768];
 		unsigned long long rip = ctxt->uc_mcontext.gregs.rip;
 		unsigned char bytes[16];
 		int nbytes = 0;
@@ -306,25 +382,337 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			bytes[i] = ((unsigned char*)(unsigned long)rip)[i];
 			nbytes++;
 		}
+		int self = linux_self_pid();
+		unsigned long long rbp = ctxt->uc_mcontext.gregs.rbp;
+		unsigned long long retaddr = 0;
+		if (rbp != 0)
+			retaddr = *(unsigned long long *)(unsigned long)(rbp + 8);
 		n = __simple_snprintf(buf, sizeof(buf),
-			"CRASH sig=%d code=%d addr=%p rip=0x%llx rsp=0x%llx rbp=0x%llx rdi=0x%llx rsi=0x%llx rax=0x%llx bytes=%x %x %x %x %x %x %x %x\n",
+			"CRASH pid=%d sig=%d code=%d addr=%p rip=0x%llx rsp=0x%llx rbp=0x%llx rdi=0x%llx rsi=0x%llx rax=0x%llx rcx=0x%llx rdx=0x%llx rbx=0x%llx r8=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx ret=0x%llx bytes=%x %x %x %x %x %x %x %x\n",
+			self,
 			linux_signum,
 			info ? info->si_code : -1,
 			info ? info->si_addr : (void*)0,
 			rip,
 			ctxt->uc_mcontext.gregs.rsp,
-			ctxt->uc_mcontext.gregs.rbp,
+			rbp,
 			ctxt->uc_mcontext.gregs.rdi,
 			ctxt->uc_mcontext.gregs.rsi,
 			ctxt->uc_mcontext.gregs.rax,
+			ctxt->uc_mcontext.gregs.rcx,
+			ctxt->uc_mcontext.gregs.rdx,
+			ctxt->uc_mcontext.gregs.rbx,
+			ctxt->uc_mcontext.gregs.r8,
+			ctxt->uc_mcontext.gregs.r12,
+			ctxt->uc_mcontext.gregs.r13,
+			ctxt->uc_mcontext.gregs.r14,
+			ctxt->uc_mcontext.gregs.r15,
+			retaddr,
 			(unsigned)bytes[0], (unsigned)bytes[1], (unsigned)bytes[2], (unsigned)bytes[3],
 			(unsigned)bytes[4], (unsigned)bytes[5], (unsigned)bytes[6], (unsigned)bytes[7]);
 		(void)nbytes;
+		(void)sigexc_setnext_dump_v1;
+		__simple_printf("%s", buf);
 		fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
 			LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
 		if (fd >= 0) {
 			LINUX_SYSCALL3(__NR_write, fd, buf, n);
 			LINUX_SYSCALL1(__NR_close, fd);
+		}
+		{
+			/* SetNext vs GetNext: qword at rbx (slot) and rcx (decoded next). */
+			unsigned long long slot_addrs[6];
+			int si, memfd;
+			char dump[512];
+			int dn;
+			unsigned char *cp = (unsigned char *)0x7fffffe00000ULL;
+
+			slot_addrs[0] = ctxt->uc_mcontext.gregs.rbx;
+			slot_addrs[1] = ctxt->uc_mcontext.gregs.rcx;
+			slot_addrs[2] = ctxt->uc_mcontext.gregs.rcx + 0x21B0ULL;
+			slot_addrs[3] = ctxt->uc_mcontext.gregs.rcx + 0x4360ULL;
+			slot_addrs[4] = ctxt->uc_mcontext.gregs.rcx + 0x10ULL;
+			slot_addrs[5] = ctxt->uc_mcontext.gregs.rcx + 152ULL;
+			dn = __simple_snprintf(dump, sizeof(dump),
+			    "COMMPAGE pid=%d ver=%u kshift=%u ushift=%u\n",
+			    self, (unsigned)((unsigned short *)(cp + 0x1e))[0],
+			    (unsigned)cp[0x4d], (unsigned)cp[0x4e]);
+			if (dn > (int)sizeof(dump) - 1)
+				dn = (int)sizeof(dump) - 1;
+			__simple_printf("%s", dump);
+			fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+			    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+			if (fd >= 0) {
+				LINUX_SYSCALL3(__NR_write, fd, dump, dn);
+				LINUX_SYSCALL1(__NR_close, fd);
+			}
+			memfd = LINUX_SYSCALL(__NR_open, "/proc/self/mem",
+			    LINUX_O_RDONLY, 0);
+			for (si = 0; si < 6; si++) {
+				unsigned long long a = slot_addrs[si];
+				unsigned long long w0 = 0, w1 = 0;
+				long got0 = -1, got1 = -1;
+				unsigned long long bswap0, decoded;
+				unsigned char vec = 0;
+				long mc;
+
+				if (a < (1ULL << 40))
+					continue;
+				mc = LINUX_SYSCALL3(__NR_mincore, a & ~0xfffULL, 4096UL, &vec);
+				if (memfd >= 0) {
+					got0 = LINUX_SYSCALL(__NR_pread64, memfd, &w0, 8, LL_ARG(a));
+					got1 = LINUX_SYSCALL(__NR_pread64, memfd, &w1, 8, LL_ARG(a + 8));
+				}
+				bswap0 = __builtin_bswap64(w0);
+				decoded = (a & 0xFFFFFFFC00000000ULL) | (bswap0 & 0x3FFFFFFFFULL);
+				dn = __simple_snprintf(dump, sizeof(dump),
+				    "SETNEXT pid=%d slot=0x%llx enc=0x%llx sh=0x%llx got=%ld,%ld mc=%ld vec=%d bswap=0x%llx decoded=0x%llx\n",
+				    self, a, w0, w1, got0, got1, mc, (int)vec, bswap0, decoded);
+				if (dn > (int)sizeof(dump) - 1)
+					dn = (int)sizeof(dump) - 1;
+				__simple_printf("%s", dump);
+				fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+				    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+				if (fd >= 0) {
+					LINUX_SYSCALL3(__NR_write, fd, dump, dn);
+					LINUX_SYSCALL1(__NR_close, fd);
+				}
+			}
+			{
+				unsigned long long slot, super, meta, span;
+				unsigned long long w[6];
+				unsigned int packed, alloc, unprov;
+				unsigned char vec = 0;
+				long got, mc;
+				int pi, qi, hit;
+				char m18[640];
+				int mn;
+
+				(void)sigexc_meta18_vis_v1;
+				slot = ctxt->uc_mcontext.gregs.rcx;
+				if (slot < (1ULL << 40))
+					slot = ctxt->uc_mcontext.gregs.r14;
+				if (slot < (1ULL << 40))
+					slot = ctxt->uc_mcontext.gregs.rbx;
+				if (slot >= (1ULL << 40) && slot < (4ULL << 40)) {
+				super = slot & ~0x1FFFFFULL;
+				meta = super + 0x1000ULL;
+				mn = __simple_snprintf(m18, sizeof(m18),
+				    "META18 pid=%d slot=0x%llx super=0x%llx meta=0x%llx r8=0x%llx r12=0x%llx rax=0x%llx\n",
+				    self, slot, super, meta,
+				    ctxt->uc_mcontext.gregs.r8,
+				    ctxt->uc_mcontext.gregs.r12,
+				    ctxt->uc_mcontext.gregs.rax);
+				if (mn > (int)sizeof(m18) - 1)
+					mn = (int)sizeof(m18) - 1;
+				__simple_printf("%s", m18);
+				fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+				    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+				if (fd >= 0) {
+					LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+					LINUX_SYSCALL1(__NR_close, fd);
+				}
+				darling_pa_twva_report((unsigned long)super);
+				darling_pa_root98_report((unsigned long)super, slot);
+				darling_pa_root98_crash((unsigned long)rbp,
+				    (unsigned long)slot);
+				if (memfd < 0)
+					memfd = LINUX_SYSCALL(__NR_open, "/proc/self/mem",
+					    LINUX_O_RDONLY, 0);
+				for (pi = 0; pi < 3; pi++) {
+					unsigned long long mbase = super + (pi == 0 ? 0x1000ULL :
+					    (pi == 1 ? 0x2000ULL : 0x4000ULL));
+					unsigned char page[4096];
+					long pg = -1;
+
+					mc = LINUX_SYSCALL3(__NR_mincore, mbase & ~0xfffULL, 4096UL, &vec);
+					if (memfd >= 0)
+						pg = LINUX_SYSCALL(__NR_pread64, memfd, page, 4096, LL_ARG(mbase));
+					mn = __simple_snprintf(m18, sizeof(m18),
+					    "META18PAGE pid=%d base=0x%llx got=%ld mc=%ld vec=%d\n",
+					    self, mbase, pg, mc, (int)vec);
+					if (mn > (int)sizeof(m18) - 1)
+						mn = (int)sizeof(m18) - 1;
+					__simple_printf("%s", m18);
+					fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+					    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+					if (fd >= 0) {
+						LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+						LINUX_SYSCALL1(__NR_close, fd);
+					}
+					if (pg < 32)
+						continue;
+					hit = 0;
+					for (qi = 0; qi + 32 <= (int)pg; qi += 8) {
+						unsigned long long h = 0;
+						int b;
+
+						for (b = 0; b < 8; b++)
+							h |= ((unsigned long long)page[qi + b]) << (8 * b);
+						if (h != slot)
+							continue;
+						if ((qi & 31) != 0)
+							continue;
+						span = mbase + (unsigned long long)qi;
+						for (b = 0; b < 6; b++) {
+							w[b] = 0;
+							if (qi + b * 8 + 8 <= (int)pg) {
+								int k;
+								for (k = 0; k < 8; k++)
+									w[b] |= ((unsigned long long)page[qi + b * 8 + k]) << (8 * k);
+							}
+						}
+						packed = (unsigned int)w[3];
+						alloc = packed & 0x7fffU;
+						unprov = (packed >> 15) & 0x7fffU;
+						mn = __simple_snprintf(m18, sizeof(m18),
+						    "META18HIT pid=%d span=0x%llx off=%d packed=0x%x alloc=%u unprov=%u sum=%u freeish=%u head=0x%llx next=0x%llx bucket=0x%llx w18=0x%llx\n",
+						    self, span, qi, packed, alloc, unprov,
+						    alloc + unprov,
+						    (unsigned)ctxt->uc_mcontext.gregs.rax - (alloc + unprov),
+						    w[0], w[1], w[2], w[3]);
+						if (mn > (int)sizeof(m18) - 1)
+							mn = (int)sizeof(m18) - 1;
+						__simple_printf("%s", m18);
+						fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+						    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+						if (fd >= 0) {
+							LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+							LINUX_SYSCALL1(__NR_close, fd);
+						}
+						hit = 1;
+						break;
+					}
+					if (!hit) {
+						unsigned int p4, p16;
+						unsigned long long o4, o16;
+
+						p4 = (unsigned int)((slot - super) >> 12);
+						p16 = (unsigned int)((slot - super) >> 14);
+						o4 = mbase + (unsigned long long)p4 * 32ULL;
+						o16 = mbase + (unsigned long long)p16 * 32ULL;
+						got = -1;
+						w[0] = w[1] = w[2] = w[3] = 0;
+						if (memfd >= 0)
+							got = LINUX_SYSCALL(__NR_pread64, memfd, w, 32, LL_ARG(o4));
+						packed = (unsigned int)w[3];
+						alloc = packed & 0x7fffU;
+						unprov = (packed >> 15) & 0x7fffU;
+						mn = __simple_snprintf(m18, sizeof(m18),
+						    "META18IDX pid=%d idx4=%u a4=0x%llx got=%ld packed=0x%x alloc=%u unprov=%u sum=%u head=0x%llx bucket=0x%llx idx16=%u a16=0x%llx\n",
+						    self, p4, o4, got, packed, alloc, unprov,
+						    alloc + unprov, w[0], w[2], p16, o16);
+						if (mn > (int)sizeof(m18) - 1)
+							mn = (int)sizeof(m18) - 1;
+						__simple_printf("%s", m18);
+						fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+						    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+						if (fd >= 0) {
+							LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+							LINUX_SYSCALL1(__NR_close, fd);
+						}
+						w[0] = w[1] = w[2] = w[3] = 0;
+						got = -1;
+						if (memfd >= 0)
+							got = LINUX_SYSCALL(__NR_pread64, memfd, w, 32, LL_ARG(o16));
+						packed = (unsigned int)w[3];
+						alloc = packed & 0x7fffU;
+						unprov = (packed >> 15) & 0x7fffU;
+						mn = __simple_snprintf(m18, sizeof(m18),
+						    "META18I16 pid=%d a16=0x%llx got=%ld packed=0x%x alloc=%u unprov=%u head=0x%llx bucket=0x%llx\n",
+						    self, o16, got, packed, alloc, unprov, w[0], w[2]);
+						if (mn > (int)sizeof(m18) - 1)
+							mn = (int)sizeof(m18) - 1;
+						__simple_printf("%s", m18);
+						fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+						    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+						if (fd >= 0) {
+							LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+							LINUX_SYSCALL1(__NR_close, fd);
+						}
+						if (mn > (int)sizeof(m18) - 1)
+							mn = (int)sizeof(m18) - 1;
+						__simple_printf("%s", m18);
+						fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+						    LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+						if (fd >= 0) {
+							LINUX_SYSCALL3(__NR_write, fd, m18, mn);
+							LINUX_SYSCALL1(__NR_close, fd);
+						}
+					}
+				}
+				}
+			}
+			if (memfd >= 0)
+				LINUX_SYSCALL1(__NR_close, memfd);
+		}
+		{
+			char line[512];
+			char chunk[256];
+			int linelen = 0;
+			int found = 0;
+			int mfd = LINUX_SYSCALL(__NR_open, "/proc/self/maps", LINUX_O_RDONLY, 0);
+			if (mfd >= 0) {
+				long got;
+				while (!found && (got = LINUX_SYSCALL3(__NR_read, mfd, chunk, sizeof(chunk))) > 0) {
+					for (long i = 0; i < got; i++) {
+						if (linelen < (int)sizeof(line) - 1)
+							line[linelen++] = chunk[i];
+						if (chunk[i] != '\n' && linelen != (int)sizeof(line) - 1)
+							continue;
+						line[linelen] = 0;
+						unsigned long lo = 0, hi = 0;
+						const char *p = line;
+						while (*p && *p != '-') {
+							unsigned v;
+							if (*p >= '0' && *p <= '9')
+								v = (unsigned)(*p - '0');
+							else if (*p >= 'a' && *p <= 'f')
+								v = (unsigned)(*p - 'a' + 10);
+							else if (*p >= 'A' && *p <= 'F')
+								v = (unsigned)(*p - 'A' + 10);
+							else
+								break;
+							lo = (lo << 4) | v;
+							p++;
+						}
+						if (*p == '-')
+							p++;
+						while (*p && *p != ' ') {
+							unsigned v;
+							if (*p >= '0' && *p <= '9')
+								v = (unsigned)(*p - '0');
+							else if (*p >= 'a' && *p <= 'f')
+								v = (unsigned)(*p - 'a' + 10);
+							else if (*p >= 'A' && *p <= 'F')
+								v = (unsigned)(*p - 'A' + 10);
+							else
+								break;
+							hi = (hi << 4) | v;
+							p++;
+						}
+						if (rip >= lo && rip < hi) {
+							char out[640];
+							int on = __simple_snprintf(out, sizeof(out),
+								"CRASHMAP pid=%d rip=0x%llx %s",
+								self, rip, line);
+							if (on > (int)sizeof(out) - 1)
+								on = (int)sizeof(out) - 1;
+							__simple_printf("%s", out);
+							fd = LINUX_SYSCALL(__NR_open, "/tmp/sigtrap-rip.log",
+								LINUX_O_WRONLY | LINUX_O_CREAT | LINUX_O_APPEND, 0644);
+							if (fd >= 0) {
+								LINUX_SYSCALL3(__NR_write, fd, out, on);
+								LINUX_SYSCALL1(__NR_close, fd);
+							}
+							found = 1;
+							break;
+						}
+						linelen = 0;
+					}
+				}
+				LINUX_SYSCALL1(__NR_close, mfd);
+			}
 		}
 	}
 #endif
@@ -378,7 +766,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			if (bsd_signum == SIGTSTP || bsd_signum == SIGSTOP)
 			{
 				kern_printf("sigexc: emulating SIGTSTP/SIGSTOP\n");
-				LINUX_SYSCALL(__NR_kill, 0, LINUX_SIGSTOP);
+				LINUX_SYSCALL(__NR_kill, linux_self_pid(), LINUX_SIGSTOP);
 			}
 			else
 			{
@@ -394,8 +782,15 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 						&sa, NULL,
 						sizeof(sa.sa_mask));
 
-				// Resend signal to self
-				LINUX_SYSCALL(__NR_kill, 0, linux_signum);
+				/*
+				 * Linux kill(0, sig) is the whole process group.
+				 * Chrome helpers share the browser pgrp, so a
+				 * default SIGSEGV (ImmediateCrash movl $0,0)
+				 * used to SIGSEGV GPU/network/storage together.
+				 */
+				int self = linux_self_pid();
+				__simple_printf("sigexc_kill_self_v1 pid=%d sig=%d\n", self, linux_signum);
+				LINUX_SYSCALL(__NR_kill, self, linux_signum);
 			}
 		}
 	}

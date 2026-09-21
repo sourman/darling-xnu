@@ -15,10 +15,15 @@ long sys_setrlimit(unsigned int which, const struct xnu_rlimit* rlp)
 	if (which == -1)
 		return -EINVAL;
 
+	rlim_bsd_to_linux_val(&lim.rlim_cur);
+	rlim_bsd_to_linux_val(&lim.rlim_max);
+
 	if (which == LINUX_RLIMIT_NOFILE)
 	{
-		lim.rlim_cur++;
-		lim.rlim_max++;
+		if (lim.rlim_cur != LINUX_RLIM_INFINITY)
+			lim.rlim_cur++;
+		if (lim.rlim_max != LINUX_RLIM_INFINITY)
+			lim.rlim_max++;
 	}
 
 	ret = LINUX_SYSCALL(__NR_prlimit64, 0, which, &lim, 0);

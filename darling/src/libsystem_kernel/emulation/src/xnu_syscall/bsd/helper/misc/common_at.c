@@ -13,6 +13,8 @@ int atflags_bsd_to_linux(int flags)
 		linux_flags |= LINUX_AT_SYMLINK_FOLLOW;
 	if (flags & BSD_AT_FDONLY)
 		linux_flags |= LINUX_AT_EMPTY_PATH;
+	if (flags & BSD_AT_EACCESS)
+		linux_flags |= LINUX_AT_EACCESS;
 	flags &= ~BSD_AT_SYMLINK_NOFOLLOW;
 	flags &= ~BSD_AT_REMOVEDIR;
 	flags &= ~BSD_AT_REMOVEDIR_DATALESS;

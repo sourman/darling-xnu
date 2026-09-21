@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/spawn.h>
 #include <sys/fcntl.h>
+#include <sys/errno.h>
 #include <_libkernel_init.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/process/execve.h>
@@ -45,8 +46,28 @@
 #endif
 
 #define LINUX_ADDR_NO_RANDOMIZE 0x40000
+#define DARLING_MAX_FILEPORT_DUP2 64
 
 extern _libkernel_functions_t _libkernel_functions;
+
+/* Overlay confirm: nsenter strings on libsystem_kernel.dylib. */
+static const char comet_posix_spawn_fileport_dup2_v1[] = "posix_spawn_fileport_dup2_v1";
+
+static int
+spawn_fileport_makefd(unsigned int port)
+{
+	int newfd = -1;
+	int err;
+
+	if (port == 0 || port == 0xffffffffu)
+		return -EBADF;
+	err = dserver_rpc_fileport_makefd(port, &newfd);
+	if (err < 0)
+		return err;
+	if (err > 0)
+		return -err;
+	return newfd;
+}
 
 long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_desc* desc,
 		char** argvp, char** envp)
@@ -54,17 +75,58 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 	int ret, my_pid;
 	int pipe[2] = { -1, -1 };
 	unsigned int spawn_flags = (desc && desc->attrp) ? desc->attrp->psa_flags : 0;
+	int fp_tmpfd[DARLING_MAX_FILEPORT_DUP2];
+	int fp_dest[DARLING_MAX_FILEPORT_DUP2];
+	int fp_n = 0;
+	int fp_i;
+
+	(void)comet_posix_spawn_fileport_dup2_v1;
+	for (fp_i = 0; fp_i < DARLING_MAX_FILEPORT_DUP2; fp_i++)
+		fp_tmpfd[fp_i] = -1;
 
 	__simple_kprintf("posix_spawn_v1 path=%s flags=0x%x fact=%d\n",
 		path ? path : "(null)", spawn_flags,
 		(desc && desc->factp) ? (int)desc->factp->psfa_act_count : 0);
+
+	/*
+	 * Darling posix_spawn is fork+exec. The child gets a fresh Mach ipc
+	 * space (ipc_task_init), so FILEPORT_DUP2 cannot look up the parent's
+	 * fileport name after fork. Resolve to a Linux fd in the parent first;
+	 * Linux fork copies that fd, then the child dup2's it to dest.
+	 * CLOEXEC_DEFAULT would otherwise drop every fd that is not a dest.
+	 */
+	if (desc && desc->factp) {
+		int i;
+		for (i = 0; i < desc->factp->psfa_act_count; i++) {
+			const struct xnu__psfa_action* act = &desc->factp->psfa_act_acts[i];
+			int dest = act->psfaa_dup2args.psfad_newfiledes;
+
+			__simple_kprintf("posix_spawn_v1 fact i=%d type=%d fd=%d dest=%d port=0x%x\n",
+				i, (int)act->psfaa_type, act->psfaa_filedes, dest,
+				(unsigned)act->psfaa_fileport);
+			if (act->psfaa_type != XNU_PSFA_FILEPORT_DUP2)
+				continue;
+			if (fp_n >= DARLING_MAX_FILEPORT_DUP2) {
+				__simple_kprintf("posix_spawn_fileport_dup2_v1 overflow n=%d\n", fp_n);
+				return -ENOMEM;
+			}
+			ret = spawn_fileport_makefd((unsigned)act->psfaa_fileport);
+			__simple_kprintf("posix_spawn_fileport_dup2_v1 pre port=0x%x dest=%d tmp=%d\n",
+				(unsigned)act->psfaa_fileport, dest, ret);
+			if (ret < 0)
+				return ret;
+			fp_tmpfd[fp_n] = ret;
+			fp_dest[fp_n] = dest;
+			fp_n++;
+		}
+	}
 
 	if (desc && desc->attrp && desc->attrp->psa_flags & POSIX_SPAWN_SETEXEC)
 		goto no_fork;
 
 	ret = LINUX_SYSCALL(__NR_pipe2, pipe, LINUX_O_CLOEXEC);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	// we don't want to call user atfork callbacks, but we *do* want to call most
 	// libsystem atfork callbacks to set up the environment for some of the calls we need
@@ -266,6 +328,36 @@ no_fork:
 							goto fail;
 						break;
 
+					case XNU_PSFA_FILEPORT_DUP2:
+					{
+						int dest = act->psfaa_dup2args.psfad_newfiledes;
+						int tmp = -1;
+						int k = fp_n;
+
+						for (k = 0; k < fp_n; k++) {
+							if (fp_dest[k] == dest && fp_tmpfd[k] >= 0) {
+								tmp = fp_tmpfd[k];
+								break;
+							}
+						}
+						if (tmp < 0)
+							tmp = spawn_fileport_makefd((unsigned)act->psfaa_fileport);
+						__simple_kprintf("posix_spawn_fileport_dup2_v1 child port=0x%x tmp=%d dest=%d\n",
+							(unsigned)act->psfaa_fileport, tmp, dest);
+						if (tmp < 0) {
+							ret = tmp;
+							goto fail;
+						}
+						ret = sys_dup2(tmp, dest);
+						if (ret < 0)
+							goto fail;
+						if (tmp != dest)
+							close_internal(tmp);
+						if (k < fp_n)
+							fp_tmpfd[k] = -1;
+						break;
+					}
+
 					case XNU_PSFA_OPEN:
 					{
 						//__simple_kprintf("opening %s to %d\n", act->psfaa_openargs.psfao_path, act->psfaa_filedes);
@@ -406,7 +498,7 @@ fail:
 		{
 			// no_fork case
 			ret = errno_linux_to_bsd(ret);
-			return ret;
+			goto out;
 		}
 		else
 		{
@@ -440,5 +532,9 @@ fail:
 	}
 
 out:
+	for (fp_i = 0; fp_i < fp_n; fp_i++) {
+		if (fp_tmpfd[fp_i] >= 0)
+			close_internal(fp_tmpfd[fp_i]);
+	}
 	return ret;
 }

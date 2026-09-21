@@ -34,6 +34,7 @@ kern_return_t _kernelrpc_mach_port_destroy_trap_impl(mach_port_name_t target, ma
 kern_return_t _kernelrpc_mach_port_destruct_trap_impl(mach_port_name_t target, mach_port_name_t name, mach_port_delta_t srdelta, uint64_t guard);
 kern_return_t _kernelrpc_mach_port_extract_member_trap_impl(mach_port_name_t target, mach_port_name_t name, mach_port_name_t pset);
 kern_return_t _kernelrpc_mach_port_get_attributes_impl(mach_port_name_t target, mach_port_name_t name, mach_port_flavor_t flavor, mach_port_info_t port_info_out, mach_msg_type_number_t* port_info_outCnt);
+kern_return_t _kernelrpc_mach_port_peek_impl(mach_port_name_t target, mach_port_name_t name, mach_msg_trailer_type_t trailer_type, mach_port_seqno_t* seqnop, mach_msg_size_t* msg_sizep, mach_msg_id_t* msg_idp, mach_msg_trailer_info_t trailer_infop, mach_msg_type_number_t* trailer_sizep);
 kern_return_t _kernelrpc_mach_port_guard_trap_impl(mach_port_name_t target, mach_port_name_t name, uint64_t guard, boolean_t strict);
 kern_return_t _kernelrpc_mach_port_insert_member_trap_impl(mach_port_name_t target, mach_port_name_t name, mach_port_name_t pset);
 kern_return_t _kernelrpc_mach_port_insert_right_trap_impl(mach_port_name_t target, mach_port_name_t name, mach_port_name_t poly, mach_msg_type_name_t polyPoly);

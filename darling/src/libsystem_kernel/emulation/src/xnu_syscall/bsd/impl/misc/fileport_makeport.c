@@ -33,9 +33,12 @@ long sys_fileport_makeport(int fd, int* port)
 		__simple_printf("dserver_rpc_fileport_makeport failed internally: %d\n", err);
 		__simple_abort();
 	}
-	if (err > 0)
+	if (err > 0) {
+		__simple_kprintf("fileport_makeport_v1 fd=%d err=%d\n", fd, err);
 		return errno_linux_to_bsd(-err);
+	}
 
+	__simple_kprintf("fileport_makeport_v1 fd=%d port=0x%x\n", fd, (unsigned)name);
 	*port = (int)name;
 	return 0;
 }

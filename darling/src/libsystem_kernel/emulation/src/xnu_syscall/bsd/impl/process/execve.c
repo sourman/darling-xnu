@@ -188,13 +188,59 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	// set up the __mldr_sockpath env var if we're executing mldr
 	if (is_script || is_macho) {
 		const char** modenvp;
-		char* buf;
 		int len = 0;
+		int i;
+		int path_ok = 0;
 		struct linux_sockaddr_un* server_socket_address = dserver_rpc_hooks_get_server_address();
-		const char* server_socket_path = server_socket_address->sun_path;
+		const char* server_socket_path = server_socket_address ? server_socket_address->sun_path : "";
+		/*
+		 * Static: checkout RPC after this point used to smash alloca'd
+		 * sockpath (`__mldr_sockpath=/\356...`, sendmsg ENOENT).
+		 */
+		static char sockpath_env[sizeof("__mldr_sockpath=") + sizeof(((struct linux_sockaddr_un*)0)->sun_path)];
+		static char mldr_lifetime_pipe_env[32];
+		static const char sockpath_static_v1[] = "mldr_sockpath_static_v1";
 
-		char mldr_lifetime_pipe_env[32] = { '\0' };
+		(void)sockpath_static_v1;
+
+		if (server_socket_path[0] == '/') {
+			static const char sock_suffix[] = "darlingserver.sock";
+			for (i = 0; server_socket_path[i] != 0 && i < (int)sizeof(((struct linux_sockaddr_un*)0)->sun_path); ++i) {
+				int k;
+				if (server_socket_path[i] != 'd')
+					continue;
+				for (k = 0; sock_suffix[k] != 0 && server_socket_path[i + k] == sock_suffix[k]; ++k)
+					;
+				if (sock_suffix[k] == 0 && server_socket_path[i + k] == 0) {
+					path_ok = 1;
+					break;
+				}
+			}
+		}
+		if (!path_ok) {
+			const char* dp = NULL;
+			for (i = 0; envp && envp[i]; ++i) {
+				const char* ev = envp[i];
+				if (ev[0] == 'D' && ev[1] == 'P' && ev[2] == 'R' && ev[3] == 'E' &&
+				    ev[4] == 'F' && ev[5] == 'I' && ev[6] == 'X' && ev[7] == '=') {
+					dp = ev + 8;
+					break;
+				}
+			}
+			if (dp && dp[0] == '/')
+				server_socket_path = dp; /* DPREFIX; append sock name below */
+		}
+
+		mldr_lifetime_pipe_env[0] = '\0';
 		__simple_snprintf(mldr_lifetime_pipe_env, sizeof(mldr_lifetime_pipe_env) - 1, "__mldr_lifetime_pipe=%d", __dserver_get_process_lifetime_pipe());
+
+		if (path_ok) {
+			__simple_snprintf(sockpath_env, sizeof(sockpath_env), "__mldr_sockpath=%s", server_socket_path);
+		} else if (server_socket_path && server_socket_path[0] == '/') {
+			__simple_snprintf(sockpath_env, sizeof(sockpath_env), "__mldr_sockpath=%s/.darlingserver.sock", server_socket_path);
+		} else {
+			__simple_snprintf(sockpath_env, sizeof(sockpath_env), "__mldr_sockpath=");
+		}
 
 		// count original env vars
 		while (envp[len++]);
@@ -203,12 +249,7 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 
 		// allocate a new envp and env0, env1
 		modenvp = (const char**)__builtin_alloca(sizeof(void*) * (len + new_env_count));
-		buf = __builtin_alloca(strlen(server_socket_path) + sizeof("__mldr_sockpath="));
-
-		// set up the new env0
-		strcpy(buf, "__mldr_sockpath=");
-		strcat(buf, server_socket_path);
-		modenvp[0] = buf;
+		modenvp[0] = sockpath_env;
 		modenvp[1] = mldr_lifetime_pipe_env;
 
 		// append original env vars

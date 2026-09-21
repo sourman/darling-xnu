@@ -323,15 +323,21 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 				if (!ctxt->unknown_component)
 				{
 					stat_t st;
-					#if defined(__NR_lstat)
-						int status = LINUX_SYSCALL(__NR_lstat, ctxt->current_path, &st);
-					#else
-						#if __NR_newfstatat
-							int status = LINUX_SYSCALL(__NR_newfstatat, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+					int status;
+					int st_tries;
+					for (st_tries = 0; st_tries < 8; st_tries++) {
+						#if defined(__NR_lstat)
+							status = LINUX_SYSCALL(__NR_lstat, ctxt->current_path, &st);
 						#else
-							int status = LINUX_SYSCALL(__NR_fstatat64, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+							#if __NR_newfstatat
+								status = LINUX_SYSCALL(__NR_newfstatat, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+							#else
+								status = LINUX_SYSCALL(__NR_fstatat64, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+							#endif
 						#endif
-					#endif
+						if (status != -LINUX_ESTALE)
+							break;
+					}
 
 					if (icase_enabled && status == -LINUX_ENOENT)
 					{

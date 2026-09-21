@@ -33,6 +33,16 @@
 #include <mach/mach_sync_ipc.h>
 #include "tsd.h"
 
+extern kern_return_t _kernelrpc_mach_port_peek_impl(
+	mach_port_name_t target,
+	mach_port_name_t name,
+	mach_msg_trailer_type_t trailer_type,
+	mach_port_seqno_t *seqnop,
+	mach_msg_size_t *msg_sizep,
+	mach_msg_id_t *msg_idp,
+	mach_msg_trailer_info_t trailer_infop,
+	mach_msg_type_number_t *trailer_sizep);
+
 
 kern_return_t
 mach_port_names(
@@ -182,6 +192,13 @@ mach_port_peek(
 	mach_msg_type_number_t  *trailer_sizep)
 {
 	kern_return_t rv;
+
+	rv = _kernelrpc_mach_port_peek_impl(task, name, trailer_type,
+	    seqnop, msg_sizep, msg_idp,
+	    trailer_infop, trailer_sizep);
+	if (rv != MACH_SEND_INVALID_DEST) {
+		return rv;
+	}
 
 	rv = _kernelrpc_mach_port_peek(task, name, trailer_type,
 	    seqnop, msg_sizep, msg_idp,
