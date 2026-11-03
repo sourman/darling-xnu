@@ -17,20 +17,23 @@ static auditinfo_addr_t info = {
 	.ai_asid = AU_DEFAUDITSID,
 	.ai_flags = 0,
 };
-// should be a rw lock but *shrug*
+// should be a rw lock but *shrug*. Not the libplatform symbol: defining that
+// here exported an empty lock and broke every other image's unlock.
 static os_unfair_lock info_lock = OS_UNFAIR_LOCK_INIT;
+static void kernel_unfair_lock(os_unfair_lock_t lock) { (void)lock; }
+static void kernel_unfair_unlock(os_unfair_lock_t lock) { (void)lock; }
 
 long sys_getaudit_addr(struct auditinfo_addr* auditinfo_addr, int length) {
-	os_unfair_lock_lock(&info_lock);
+	kernel_unfair_lock(&info_lock);
 
 	memcpy(auditinfo_addr, &info, min(length, sizeof(auditinfo_addr_t)));
 
-	os_unfair_lock_unlock(&info_lock);
+	kernel_unfair_unlock(&info_lock);
 	return 0;
 };
 
 long sys_setaudit_addr(struct auditinfo_addr* auditinfo_addr, int length) {
-	os_unfair_lock_lock(&info_lock);
+	kernel_unfair_lock(&info_lock);
 
 	memcpy(&info, auditinfo_addr, min(length, sizeof(auditinfo_addr_t)));
 
@@ -39,6 +42,6 @@ long sys_setaudit_addr(struct auditinfo_addr* auditinfo_addr, int length) {
 		sys_getentropy(&info.ai_asid, sizeof(info.ai_asid));
 	}
 
-	os_unfair_lock_unlock(&info_lock);
+	kernel_unfair_unlock(&info_lock);
 	return 0;
 };
