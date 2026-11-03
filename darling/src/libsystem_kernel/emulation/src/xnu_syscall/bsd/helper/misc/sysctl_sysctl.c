@@ -7,14 +7,35 @@
 
 enum {
 	_PROC_CPUTYPE = 1000,
+	_PROC_TRANSLATED = 1001,
 };
 
 static sysctl_handler(handle_proc_cputype);
+static sysctl_handler(handle_proc_translated);
 
 const struct known_sysctl sysctls_sysctl[] = {
 	{ .oid = _PROC_CPUTYPE, .type = CTLTYPE_INT, .exttype = "I", .name = "proc_cputype", .handler = handle_proc_cputype },
+	{ .oid = _PROC_TRANSLATED, .type = CTLTYPE_INT, .exttype = "I", .name = "proc_translated", .handler = handle_proc_translated },
 	{ .oid = -1 }
 };
+
+/* Darling runs the guest natively, so the process is never translated. */
+sysctl_handler(handle_proc_translated)
+{
+	if (oldlen == NULL)
+		return -EINVAL;
+	if (old == NULL)
+	{
+		*oldlen = sizeof(int);
+		return 0;
+	}
+	if (*oldlen < sizeof(int))
+		return -ENOMEM;
+
+	*((int*) old) = 0;
+	*oldlen = sizeof(int);
+	return 0;
+}
 
 sysctl_handler(handle_proc_cputype)
 {

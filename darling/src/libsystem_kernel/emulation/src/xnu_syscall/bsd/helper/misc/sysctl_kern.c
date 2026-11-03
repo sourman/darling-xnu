@@ -23,6 +23,7 @@
 enum {
 	_KERN_MSGBUF = 1000,
 	_KERN_OSPRODUCTVERSION,
+	_KERN_HV_VMM_PRESENT,
 
 	_KERN_SEMMNS = 1000,
 };
@@ -46,6 +47,7 @@ static sysctl_handler(handle_usrstack64);
 static sysctl_handler(handle_sysv_semmns);
 static sysctl_handler(handle_osproductversion);
 static sysctl_handler(handle_osrevision);
+static sysctl_handler(handle_hv_vmm_present);
 
 extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
 extern int _sysctl_procargs(int pid, char* buf, unsigned long* buflen);
@@ -76,6 +78,7 @@ const struct known_sysctl sysctls_kern[] = {
 	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
 	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
 	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
+	{ .oid = _KERN_HV_VMM_PRESENT, .type = CTLTYPE_INT, .exttype = "I", .name = "hv_vmm_present", .handler = handle_hv_vmm_present },
 	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
 	{ .oid = -1 }
 };
@@ -278,6 +281,20 @@ sysctl_handler(handle_netboot)
 		return -EINVAL;
 
 	if (*oldlen >= sizeof(int))
+		*ovalue = 0;
+	*oldlen = sizeof(int);
+
+	return 0;
+}
+
+/* Not a hypervisor guest. Chromium PCHECKs that this node exists. */
+sysctl_handler(handle_hv_vmm_present)
+{
+	int* ovalue = (int*) old;
+	if (!oldlen)
+		return -EINVAL;
+
+	if (old && *oldlen >= sizeof(int))
 		*ovalue = 0;
 	*oldlen = sizeof(int);
 
