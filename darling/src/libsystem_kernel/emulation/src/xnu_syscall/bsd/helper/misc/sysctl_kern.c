@@ -166,32 +166,28 @@ sysctl_handler(handle_ostype)
 {
 	const char* s = EMULATED_SYSNAME;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osrelease)
 {
 	const char* s = EMULATED_RELEASE;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_version)
 {
 	const char* s = EMULATED_VERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osversion)
 {
 	const char* s = EMULATED_OSVERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 
@@ -213,8 +209,10 @@ sysctl_handler(handle_hostname)
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.nodename, (char*) old, oldlen);
-	
+	rv = copyout_string(lu.nodename, (char*) old, oldlen);
+	if (rv < 0)
+		return rv;
+
 	if (_new && newlen > 0)
 	{
 		rv = LINUX_SYSCALL(__NR_sethostname, _new, newlen);
@@ -230,8 +228,10 @@ sysctl_handler(handle_domainname)
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.domainname, (char*) old, oldlen);
-	
+	rv = copyout_string(lu.domainname, (char*) old, oldlen);
+	if (rv < 0)
+		return rv;
+
 	if (_new && newlen > 0)
 	{
 		rv = LINUX_SYSCALL(__NR_setdomainname, _new, newlen);
@@ -327,8 +327,7 @@ sysctl_handler(handle_usrstack64)
 }
 
 static sysctl_handler(handle_osproductversion) {
-	copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
-	return 0;
+	return copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
 };
 
 // Apple no longer changes this value

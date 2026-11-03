@@ -40,16 +40,29 @@ const struct known_sysctl sysctls_root = {
 	.oid = 0, .type = CTLTYPE_NODE, .exttype = "", .name = "", .subctls = sysctls_global
 };
 
-void copyout_string(const char* str, char* out, unsigned long* out_len)
+int copyout_string(const char* str, char* out, unsigned long* out_len)
 {
-	unsigned long len;
-	if (out != NULL)
-		len = strlcpy(out, str, *out_len);
-	else
-		len = strlen(str);
+	unsigned long need;
+
+	/*
+	 * macOS sysctl strings report and require room for the terminating NUL.
+	 * Callers such as Chromium size the buffer from the first call (old == NULL)
+	 * as (*oldlen - 1) and then pass the original length back, so a length that
+	 * omits the NUL truncates the value.
+	 */
+	if (str == NULL)
+		str = "";
+	need = strlen(str) + 1;
+
+	if (out != NULL) {
+		if (out_len == NULL || *out_len < need)
+			return -ENOMEM;
+		strlcpy(out, str, *out_len);
+	}
 
 	if (out_len != NULL)
-		*out_len = len;
+		*out_len = need;
+	return 0;
 }
 
 long sys_sysctl(int* name, unsigned int nlen, void* old,

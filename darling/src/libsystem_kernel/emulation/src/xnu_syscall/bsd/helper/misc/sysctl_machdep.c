@@ -96,9 +96,7 @@ sysctl_handler(handle_vendor)
     __cpuid(level, eax, v.ebx, v.ecx, v.edx);
 
 	v.name[12] = 0;
-	copyout_string(v.name, (char*) old, oldlen);
-
-	return 0;
+	return copyout_string(v.name, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_max_basic)
@@ -182,9 +180,7 @@ sysctl_handler(handle_brand_string)
 		}
 
     v.name[48] = 0;
-    copyout_string(v.name, (char*) old, oldlen);
-
-    return 0;
+    return copyout_string(v.name, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_features)

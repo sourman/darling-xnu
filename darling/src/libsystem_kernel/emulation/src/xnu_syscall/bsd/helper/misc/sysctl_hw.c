@@ -190,6 +190,5 @@ sysctl_handler(handle_cpu64bitcapable)
 
 sysctl_handler(handle_machine)
 {
-	copyout_string(need_uname()->machine, (char*) old, oldlen);
-	return 0;
+	return copyout_string(need_uname()->machine, (char*) old, oldlen);
 }
