@@ -12,6 +12,8 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/ioctl/ioctl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 
+extern void* malloc(__SIZE_TYPE__ size);
+extern void free(void* ptr);
 extern void* memset(void* destination, int value, size_t length);
 extern void* memcpy(void* destination, const void* source, size_t n);
 extern size_t strnlen(const char* string, size_t max_length);
@@ -94,21 +96,34 @@ static unsigned long round_up_sizeof_u32(unsigned long number) {
 
 static int do_iflist(void* old, unsigned long* oldlen) {
 	// we only do IPv4 addresses for now
-	int tmp_sock;
-	char buf[IFC_MAX_INTERFACES * sizeof(struct linux_ifreq)];
-	struct linux_ifconf lifc = {
-		.lifc_len = sizeof(buf),
-		.lifc_buf = buf,
-	};
+	int tmp_sock = -1;
+	/* Heap, not a stack buffer. The 200-byte ifconf array used to end on
+	 * the stack canary, and the canary failure called an unresolved
+	 * __stack_chk_fail (SIGSEGV at the call, RIP ...49b9). */
+	const size_t buf_size = IFC_MAX_INTERFACES * sizeof(struct linux_ifreq);
+	char* buf = malloc(buf_size);
+	struct linux_ifreq* tmp = malloc(sizeof(*tmp));
+	struct linux_ifconf lifc;
 	int status = 0;
 	char* old_ptr = old;
 	unsigned long total_len = 0;
+
+	if (buf == NULL || tmp == NULL) {
+		status = -ENOMEM;
+		goto out;
+	}
+	memset(buf, 0, buf_size);
+	lifc.lifc_len = (int) buf_size;
+	lifc.lifc_buf = buf;
 
 	if ((status = tmp_sock = sys_socket(AF_INET, SOCK_DGRAM, 0)) < 0)
 		goto out;
 
 	if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFCONF, &lifc)) < 0)
 		goto out;
+
+	if (lifc.lifc_len < 0 || (size_t) lifc.lifc_len > buf_size)
+		lifc.lifc_len = (int) buf_size;
 
 	for (int i = 0; i < lifc.lifc_len; i += sizeof(struct linux_ifreq)) {
 		struct linux_ifreq* curr = &lifc.lifc_req[i / sizeof(struct linux_ifreq)];
@@ -124,8 +139,6 @@ static int do_iflist(void* old, unsigned long* oldlen) {
 		if (old && *oldlen >= total_len + ifm_length) {
 			struct if_msghdr* ifm = (void*)old_ptr;
 			struct sockaddr_dl* dl = (void*)(old_ptr + sizeof(struct if_msghdr));
-			struct linux_ifreq tmp;
-
 			memset(old_ptr, 0, ifm_length);
 
 			ifm->ifm_msglen = ifm_length;
@@ -145,10 +158,10 @@ static int do_iflist(void* old, unsigned long* oldlen) {
 			memcpy(dl->sdl_data, curr->lifr_name, name_len);
 
 			// grab the MAC
-			memcpy(tmp.lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
-			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFHWADDR, &tmp)) < 0)
+			memcpy(tmp->lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
+			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFHWADDR, tmp)) < 0)
 				goto out;
-			memcpy(LLADDR(dl), tmp.lifr_hwaddr.sa_data, MAC_LENGTH);
+			memcpy(LLADDR(dl), tmp->lifr_hwaddr.sa_data, MAC_LENGTH);
 
 			old_ptr += ifm_length;
 		}
@@ -159,8 +172,6 @@ static int do_iflist(void* old, unsigned long* oldlen) {
 			struct sockaddr* netmask = (void*)(old_ptr + sizeof(struct ifa_msghdr));
 			struct sockaddr* ip_addr = (void*)(old_ptr + sizeof(struct ifa_msghdr) + round_up_sizeof_u32(sizeof(struct sockaddr)));
 			struct sockaddr* broad_addr = (void*)(old_ptr + sizeof(struct ifa_msghdr) + round_up_sizeof_u32(sizeof(struct sockaddr)) * 2);
-			struct linux_ifreq tmp;
-
 			memset(old_ptr, 0, ifam_length);
 
 			ifam->ifam_msglen = ifam_length;
@@ -171,17 +182,17 @@ static int do_iflist(void* old, unsigned long* oldlen) {
 
 			sockaddr_fixup_from_linux((struct sockaddr_fixup*)ip_addr, &curr->lifr_addr, sizeof(struct linux_sockaddr));
 
-			memcpy(tmp.lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
+			memcpy(tmp->lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
 
 			// get the netmask
-			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFNETMASK, &tmp)) < 0)
+			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFNETMASK, tmp)) < 0)
 				goto out;
-			sockaddr_fixup_from_linux((struct sockaddr_fixup*)netmask, &tmp.lifr_netmask, sizeof(struct linux_sockaddr));
+			sockaddr_fixup_from_linux((struct sockaddr_fixup*)netmask, &tmp->lifr_netmask, sizeof(struct linux_sockaddr));
 
 			// get the broadcast address
-			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFBRDADDR, &tmp)) < 0)
+			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFBRDADDR, tmp)) < 0)
 				goto out;
-			sockaddr_fixup_from_linux((struct sockaddr_fixup*)broad_addr, &tmp.lifr_broadaddr, sizeof(struct linux_sockaddr));
+			sockaddr_fixup_from_linux((struct sockaddr_fixup*)broad_addr, &tmp->lifr_broadaddr, sizeof(struct linux_sockaddr));
 
 			old_ptr += ifam_length;
 		}
@@ -196,6 +207,8 @@ out:
 		// ignore errors while closing
 		close_internal(tmp_sock);
 	}
+	free(buf);
+	free(tmp);
 	*oldlen = total_len;
 	return status;
 };
