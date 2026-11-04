@@ -18,7 +18,7 @@ long sys_sysctlbyname(const char* name, unsigned long namelen, void* old, unsign
 typedef long (*sysctl_handler_t)(const int* name, int nlen, void* old, unsigned long* oldlen, void* _new, unsigned long newlen);
 
 #define sysctl_handler(_hname) long _hname(const int* name, int nlen, void* old, unsigned long* oldlen, void* _new, unsigned long newlen)
-void copyout_string(const char* str, char* out, unsigned long* out_len);
+int copyout_string(const char* str, char* out, unsigned long* out_len);
 
 struct known_sysctl
 {

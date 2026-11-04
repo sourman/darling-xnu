@@ -159,14 +159,14 @@ mach_error_string_int(mach_error_t err, boolean_t *diag)
 	}
 
 	if (sub >= sys_p->max_sub) {
-		return (char *)sys_p->bad_sub;
+		return (char *)(sys_p->bad_sub ? sys_p->bad_sub : "unknown error");
 	}
 
 	sub_p = &sys_p->subsystem[sub];
 	if (sub_p->map_table) {
 		code = err_sparse_mapit(code, sub_p->map_table, sub_p->map_count);
 	}
-	if (code >= sub_p->max_code) {
+	if (code >= sub_p->max_code || sub_p->codes == NULL || sub_p->codes[code] == NULL) {
 		return (char *)NO_SUCH_ERROR;
 	}
 

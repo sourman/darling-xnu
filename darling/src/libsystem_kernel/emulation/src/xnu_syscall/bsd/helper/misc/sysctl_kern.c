@@ -10,6 +10,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/gettimeofday.h>
+#include <darling/emulation/linux_premigration/ext/sys/linux_time.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/fcntl/open.h>
 #include <darling/emulation/common/simple.h>
@@ -23,6 +24,7 @@
 enum {
 	_KERN_MSGBUF = 1000,
 	_KERN_OSPRODUCTVERSION,
+	_KERN_HV_VMM_PRESENT,
 
 	_KERN_SEMMNS = 1000,
 };
@@ -46,6 +48,7 @@ static sysctl_handler(handle_usrstack64);
 static sysctl_handler(handle_sysv_semmns);
 static sysctl_handler(handle_osproductversion);
 static sysctl_handler(handle_osrevision);
+static sysctl_handler(handle_hv_vmm_present);
 
 extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
 extern int _sysctl_procargs(int pid, char* buf, unsigned long* buflen);
@@ -76,6 +79,7 @@ const struct known_sysctl sysctls_kern[] = {
 	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
 	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
 	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
+	{ .oid = _KERN_HV_VMM_PRESENT, .type = CTLTYPE_INT, .exttype = "I", .name = "hv_vmm_present", .handler = handle_hv_vmm_present },
 	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
 	{ .oid = -1 }
 };
@@ -136,29 +140,35 @@ sysctl_handler(handle_argmax)
 
 sysctl_handler(handle_boottime)
 {
-	// Fill in struct timeval { tv_sec, tv_usec }
-	struct sysinfo info;
+	/* Fill in struct timeval { tv_sec, tv_usec }.
+	 * libc CLOCK_MONOTONIC is wall minus this boot time. That has to be
+	 * mach_absolute_time (Linux CLOCK_MONOTONIC). sysinfo.uptime is whole
+	 * seconds and drops the fraction, so the two clocks disagreed by
+	 * about a second and Chromium's frame time landed ahead of TimeTicks. */
+	struct timespec mono;
 	struct bsd_timeval* tv;
-
-	if (__linux_sysinfo(&info) == -1)
-		return -errno;
 
 	tv = (struct bsd_timeval*) old;
 	if (tv != NULL)
 	{
+		long usec;
+
 		if (*oldlen < sizeof(*tv))
 			return -EINVAL;
+		if (__linux_clock_gettime(CLOCK_MONOTONIC, &mono) != 0)
+			return -EAGAIN;
 		sys_gettimeofday(tv, NULL);
 
-		tv->tv_sec -= info.uptime;
-
-		// we don't want the microseconds to be constantly jumping around
-		// (that actually causes an infinite loop in `_mach_boottime_usec` in libc)
-		// but Linux doesn't give us microseconds, so just settle for 0
-		tv->tv_usec = 0;
+		usec = (long) tv->tv_usec - (long) (mono.tv_nsec / 1000);
+		tv->tv_sec -= mono.tv_sec;
+		if (usec < 0) {
+			tv->tv_sec -= 1;
+			usec += 1000000;
+		}
+		tv->tv_usec = usec;
 	}
 	*oldlen = sizeof(*tv);
-	
+
 	return 0;
 }
 
@@ -166,32 +176,28 @@ sysctl_handler(handle_ostype)
 {
 	const char* s = EMULATED_SYSNAME;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osrelease)
 {
 	const char* s = EMULATED_RELEASE;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_version)
 {
 	const char* s = EMULATED_VERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 sysctl_handler(handle_osversion)
 {
 	const char* s = EMULATED_OSVERSION;
 
-	copyout_string(s, (char*) old, oldlen);
-	return 0;
+	return copyout_string(s, (char*) old, oldlen);
 }
 
 
@@ -213,8 +219,10 @@ sysctl_handler(handle_hostname)
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.nodename, (char*) old, oldlen);
-	
+	rv = copyout_string(lu.nodename, (char*) old, oldlen);
+	if (rv < 0)
+		return rv;
+
 	if (_new && newlen > 0)
 	{
 		rv = LINUX_SYSCALL(__NR_sethostname, _new, newlen);
@@ -230,8 +238,10 @@ sysctl_handler(handle_domainname)
 	int rv = 0;
 	
 	need_uname();
-	copyout_string(lu.domainname, (char*) old, oldlen);
-	
+	rv = copyout_string(lu.domainname, (char*) old, oldlen);
+	if (rv < 0)
+		return rv;
+
 	if (_new && newlen > 0)
 	{
 		rv = LINUX_SYSCALL(__NR_setdomainname, _new, newlen);
@@ -284,6 +294,20 @@ sysctl_handler(handle_netboot)
 	return 0;
 }
 
+/* Not a hypervisor guest. Chromium PCHECKs that this node exists. */
+sysctl_handler(handle_hv_vmm_present)
+{
+	int* ovalue = (int*) old;
+	if (!oldlen)
+		return -EINVAL;
+
+	if (old && *oldlen >= sizeof(int))
+		*ovalue = 0;
+	*oldlen = sizeof(int);
+
+	return 0;
+}
+
 sysctl_handler(handle_safeboot)
 {
 	int* ovalue = (int*) old;
@@ -327,8 +351,7 @@ sysctl_handler(handle_usrstack64)
 }
 
 static sysctl_handler(handle_osproductversion) {
-	copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
-	return 0;
+	return copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
 };
 
 // Apple no longer changes this value
