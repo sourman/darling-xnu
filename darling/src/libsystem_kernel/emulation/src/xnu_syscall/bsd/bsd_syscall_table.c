@@ -428,6 +428,7 @@ void* __bsd_syscall_table[600] = {
 	[369] = sys_kevent64,
 	[372] = sys_thread_selfid,
 	[374] = sys_kevent_qos,
+	[381] = sys_mac_syscall,
 	[394] = sys_pselect,
 	[395] = sys_pselect_nocancel,
 	[396] = sys_read_nocancel,
