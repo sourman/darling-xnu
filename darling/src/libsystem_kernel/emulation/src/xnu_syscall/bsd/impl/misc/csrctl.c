@@ -38,21 +38,13 @@ long sys_mac_syscall(const char* policy, int call, void* arg)
 		name[sizeof(name) - 1] = 0;
 	}
 
+	/*
+	 * The only caller observed is AMFI call 96, dyld's policy query.
+	 * The argument is not the {input, output*} pair from older dyld:
+	 * writing through the second word faults the process. Success (0)
+	 * is the allowed result and is what dyld treats as "no error".
+	 */
 	__simple_printf("__mac_syscall subsystem %s call %d arg %p\n",
 	    name[0] ? name : "(null)", call, arg);
-
-	/*
-	 * AMFI call 96 (0x60), and the older 0x5a, is dyld's policy query.
-	 * arg points at { uint64_t input; uint64_t *output }. An unsigned
-	 * process is allowed the dyld path and interposing bits.
-	 */
-	if ((call == 96 || call == 0x5a) && arg &&
-	    name[0] == 'A' && name[1] == 'M' && name[2] == 'F' &&
-	    name[3] == 'I' && name[4] == 0) {
-		uint64_t *words = (uint64_t *)arg;
-		uint64_t *out = (uint64_t *)words[1];
-		if (out)
-			*out = 0x3ff;
-	}
 	return 0;
 }
