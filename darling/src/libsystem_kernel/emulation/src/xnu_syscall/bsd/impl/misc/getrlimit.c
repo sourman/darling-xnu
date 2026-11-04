@@ -24,6 +24,16 @@ long sys_getrlimit(unsigned int which, struct xnu_rlimit* rlp)
 		rlp->rlim_max--;
 	}
 
+	/* Linux uses (uint64_t)-1 for RLIM_INFINITY. macOS uses the maximum
+	   positive rlim_t. Chromium traps if a limit is negative. */
+	if (ret >= 0)
+	{
+		if (rlp->rlim_cur == (unsigned long long) -1)
+			rlp->rlim_cur = 0x7fffffffffffffffULL;
+		if (rlp->rlim_max == (unsigned long long) -1)
+			rlp->rlim_max = 0x7fffffffffffffffULL;
+	}
+
 	return ret;
 }
 
