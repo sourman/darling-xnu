@@ -10,6 +10,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/time/gettimeofday.h>
+#include <darling/emulation/linux_premigration/ext/sys/linux_time.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/fcntl/open.h>
 #include <darling/emulation/common/simple.h>
@@ -139,29 +140,35 @@ sysctl_handler(handle_argmax)
 
 sysctl_handler(handle_boottime)
 {
-	// Fill in struct timeval { tv_sec, tv_usec }
-	struct sysinfo info;
+	/* Fill in struct timeval { tv_sec, tv_usec }.
+	 * libc CLOCK_MONOTONIC is wall minus this boot time. That has to be
+	 * mach_absolute_time (Linux CLOCK_MONOTONIC). sysinfo.uptime is whole
+	 * seconds and drops the fraction, so the two clocks disagreed by
+	 * about a second and Chromium's frame time landed ahead of TimeTicks. */
+	struct timespec mono;
 	struct bsd_timeval* tv;
-
-	if (__linux_sysinfo(&info) == -1)
-		return -errno;
 
 	tv = (struct bsd_timeval*) old;
 	if (tv != NULL)
 	{
+		long usec;
+
 		if (*oldlen < sizeof(*tv))
 			return -EINVAL;
+		if (__linux_clock_gettime(CLOCK_MONOTONIC, &mono) != 0)
+			return -EAGAIN;
 		sys_gettimeofday(tv, NULL);
 
-		tv->tv_sec -= info.uptime;
-
-		// we don't want the microseconds to be constantly jumping around
-		// (that actually causes an infinite loop in `_mach_boottime_usec` in libc)
-		// but Linux doesn't give us microseconds, so just settle for 0
-		tv->tv_usec = 0;
+		usec = (long) tv->tv_usec - (long) (mono.tv_nsec / 1000);
+		tv->tv_sec -= mono.tv_sec;
+		if (usec < 0) {
+			tv->tv_sec -= 1;
+			usec += 1000000;
+		}
+		tv->tv_usec = usec;
 	}
 	*oldlen = sizeof(*tv);
-	
+
 	return 0;
 }
 
