@@ -97,7 +97,7 @@ struct error_subsystem {
 	const struct error_sparse_map   *map_table;
 	int                             map_count;
 };
-#define errorlib_system_null    { NULL, 0, NULL, NULL, 0 }
+#define errorlib_system_null    { 0, "unknown error", NULL, NULL, 0 }
 
 struct error_system {
 	int                             max_sub;

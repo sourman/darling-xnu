@@ -22,6 +22,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/fcntl.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/openat.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/guarded/change_fdguard_np.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/guarded/guarded_close_np.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/guarded/guarded_kqueue_np.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/guarded/guarded_open_np.h>
@@ -427,6 +428,7 @@ void* __bsd_syscall_table[600] = {
 	[369] = sys_kevent64,
 	[372] = sys_thread_selfid,
 	[374] = sys_kevent_qos,
+	[381] = sys_mac_syscall,
 	[394] = sys_pselect,
 	[395] = sys_pselect_nocancel,
 	[396] = sys_read_nocancel,
@@ -462,6 +464,7 @@ void* __bsd_syscall_table[600] = {
 	[441] = sys_guarded_open_np,
 	[442] = sys_guarded_close_np,
 	[443] = sys_guarded_kqueue_np,
+	[444] = sys_change_fdguard_np,
 	[461] = sys_getattrlistbulk,
 	[462] = sys_clonefileat,
 	[463] = sys_openat,

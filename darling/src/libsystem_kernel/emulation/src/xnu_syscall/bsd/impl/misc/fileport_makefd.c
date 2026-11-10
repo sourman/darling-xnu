@@ -1,16 +1,14 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/misc/fileport_makefd.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/misc/fileport_makeport.h>
 
-#include <darling/emulation/common/base.h>
-#include <darling/emulation/conversion/errno.h>
-#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
-#include <darling/emulation/other/mach/lkm.h>
+#include <stdint.h>
 
 long sys_fileport_makefd(int port)
 {
-	int ret = lkm_call(NR_fileport_makefd, (void*)(unsigned long) port);
-
-	if (ret < 0)
-		return errno_linux_to_bsd(ret);
-
-	return ret;
+	/*
+	 * The receive right stays in this process with the dup'd fd. Callers that
+	 * were handed the send right (including this process) look the name up
+	 * here. Names moved into another task are not in that task's table.
+	 */
+	return fileport_lookup_dup((uint32_t)port);
 }

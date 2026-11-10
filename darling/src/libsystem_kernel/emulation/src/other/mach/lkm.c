@@ -128,13 +128,27 @@ uint64_t mach_absolute_time(void)
 {
 	struct timespec ts;
 	uint64_t out;
-	
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	
-	out = ts.tv_nsec;
-	out += ts.tv_sec * NSEC_PER_SEC;
-	
-	return out;
+	static uint64_t last_out;
+
+	/*
+	 * Chromium's frame clock subtracts two TimeTicks values taken from
+	 * mach_absolute_time. A backwards step shows up as
+	 * "Frame latency is negative". CLOCK_MONOTONIC is the source; keep the
+	 * value this process has already handed out.
+	 */
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return last_out;
+
+	out = (uint64_t)ts.tv_nsec;
+	out += (uint64_t)ts.tv_sec * NSEC_PER_SEC;
+
+	for (;;) {
+		uint64_t prev = last_out;
+		if (out <= prev)
+			return prev;
+		if (__sync_bool_compare_and_swap(&last_out, prev, out))
+			return out;
+	}
 }
 
 VISIBLE
