@@ -248,7 +248,12 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		static int refused_logs;
+		if (status != -LINUX_ECONNREFUSED || refused_logs < 4) {
+			if (status == -LINUX_ECONNREFUSED)
+				refused_logs++;
+			__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		}
 		if (status == -LINUX_ECONNREFUSED)
 			return;
 		__simple_abort();
@@ -378,7 +383,12 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		static int refused_logs;
+		if (status != -LINUX_ECONNREFUSED || refused_logs < 4) {
+			if (status == -LINUX_ECONNREFUSED)
+				refused_logs++;
+			__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		}
 		if (status == -LINUX_ECONNREFUSED)
 			return;
 		__simple_abort();
