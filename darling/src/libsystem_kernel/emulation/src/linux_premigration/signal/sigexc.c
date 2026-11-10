@@ -138,8 +138,15 @@ void sigexc_setup(void)
 			__simple_abort();
 		}
 		if (tracer != 0) {
-			kern_printf("sigexc: already traced -> SIGTRAP\n");
-			sys_kill(0, SIGTRAP, 0);
+			/*
+			 * A non-zero tracer means a PT_TRACE_ME/PT_ATTACHEXC parent was
+			 * recorded. kill(0) is the process group, so this SIGTRAP also
+			 * hits every other Darling process in the container (browser,
+			 * GPU) while they sit in _linux_syscall. There is no debugger
+			 * consuming EXC_BREAKPOINT here, and the default-effect path
+			 * below would reset SIG_DFL and kill the group again. Continue.
+			 */
+			kern_printf("sigexc: already traced (tracer %d) -> not signaling the process group\n", tracer);
 		}
 	}
 #else
@@ -347,7 +354,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			if (bsd_signum == SIGTSTP || bsd_signum == SIGSTOP)
 			{
 				kern_printf("sigexc: emulating SIGTSTP/SIGSTOP\n");
-				LINUX_SYSCALL(__NR_kill, 0, LINUX_SIGSTOP);
+				LINUX_SYSCALL(__NR_kill, getpid(), LINUX_SIGSTOP);
 			}
 			else
 			{
@@ -363,8 +370,12 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 						&sa, NULL,
 						sizeof(sa.sa_mask));
 
-				// Resend signal to self
-				LINUX_SYSCALL(__NR_kill, 0, linux_signum);
+				/*
+				 * Resend to this process only. pid 0 is the process group,
+				 * which delivered one default SIGTRAP to mldr and CrGpuMain
+				 * together (both blocked in _linux_syscall).
+				 */
+				LINUX_SYSCALL(__NR_kill, getpid(), linux_signum);
 			}
 		}
 	}
