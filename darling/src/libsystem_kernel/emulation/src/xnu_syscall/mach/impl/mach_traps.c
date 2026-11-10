@@ -348,7 +348,7 @@ kern_return_t _kernelrpc_mach_vm_map_trap_impl(
 	if ((flags >> 24) == VM_MEMORY_REALLOC)
 		addr = (void*)__linux_mremap(((char*)*address) - 0x1000, 0x1000, 0x1000 + size, 0, NULL);
 	else
-		addr = mmap((void*)*address, size, prot, posix_flags, -1, 0);
+		addr = mmap((flags & VM_FLAGS_ANYWHERE) ? NULL : (void*)*address, size, prot, posix_flags, -1, 0);
 	
 	if (addr == MAP_FAILED)
 	{
