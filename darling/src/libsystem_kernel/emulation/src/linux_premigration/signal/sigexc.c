@@ -380,7 +380,26 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
 
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
-	int status = dserver_rpc_interrupt_enter();
+	int status;
+	int syscall_ret_trap = 0;
+
+#ifdef __x86_64__
+	/*
+	 * SIGTRAP at the ret after syscall (recvmsg/epoll_wait returning
+	 * ERESTARTSYS or EINTR). state_from_kernel rewrites RIP before the
+	 * later check, so that check misses and the default-effect path
+	 * resets SIG_DFL and kills the GPU. Remember the incoming frame.
+	 * Still run the server RPC: skipping it drops the exception and
+	 * the process exits during startup.
+	 */
+	if (linux_signum == 5 && ctxt != NULL) {
+		unsigned char *ip = (unsigned char *)ctxt->uc_mcontext.gregs.rip;
+		if (ip != NULL && ip[0] == 0xc3 && ip[-2] == 0x0f && ip[-1] == 0x05)
+			syscall_ret_trap = 1;
+	}
+#endif
+
+	status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
 		static int refused_logs;
@@ -470,12 +489,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 				 * kills mldr before the GPU creates the display link.
 				 * Return into the stub and let it restart the call.
 				 */
-				if (linux_signum == 5) {
-					unsigned char *ip = (unsigned char *)ctxt->uc_mcontext.gregs.rip;
-					if (ip && ip[0] == 0xc3 && ip[-2] == 0x0f && ip[-1] == 0x05) {
-						kern_printf("sigexc: syscall-return SIGTRAP, not fatal\n");
-						goto out;
+				if (syscall_ret_trap) {
+					static int noted;
+					if (noted < 4) {
+						noted++;
+						__simple_printf("sigexc: syscall-return SIGTRAP, not fatal\n");
 					}
+					goto out;
 				}
 				kern_printf("sigexc: emulating default signal effects\n");
 				// Set handler to SIG_DFL
