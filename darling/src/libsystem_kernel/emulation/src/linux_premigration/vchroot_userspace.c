@@ -453,18 +453,9 @@ done_getdents:
 				}
 
 ignore_symlink:
-
-				if (ctxt->current_root_len > 0 && ctxt->current_path_len - ctxt->current_root_len == sizeof(EXIT_PATH)-1)
-				{
-					if (strncasecmp_l(ctxt->current_path + ctxt->current_root_len, EXIT_PATH, sizeof(EXIT_PATH) - 1, LC_C_LOCALE) == 0)
-					{
-						// Switch to the real system root
-						ctxt->current_path[0] = '\0';
-						ctxt->current_path_len = 0;
-						ctxt->current_root = "";
-						ctxt->current_root_len = 0;
-					}
-				}
+				// /Volumes/SystemRoot is a bind of the host root. Do not
+				// rewrite it to a host-absolute path: launchd is chrooted
+				// into the prefix, and that path is the symlink we just followed.
 			}
 		}
 
