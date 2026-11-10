@@ -113,11 +113,57 @@ static void handle_rt_signal(int signum)
 	//external/lkm_call(0x1028, buf);
 }
 
+static void sigsegv_keep_page(int signum, struct linux_siginfo* info, void* ctxt)
+{
+	unsigned long addr;
+	unsigned long page;
+	long mapped;
+	static int mapped_pages;
+
+	/*
+	 * SetBucketContents writes the SetBucketSize header
+	 * (movl $0x400003, (%rax)) through CommandBufferHelper::GetSpace.
+	 * That page is not mapped, and the store kills the browser before
+	 * the GPU present. Map the page and retry the instruction.
+	 */
+	if (info != NULL && info->si_code == 1 && mapped_pages < 32) {
+		addr = (unsigned long)info->si_addr;
+		if (addr >= 0x100000000ull) {
+			page = addr & ~0xffful;
+			mapped = LINUX_SYSCALL6(__NR_mmap, (void*)page, 4096,
+					3 /* RW */, 0x32 /* FIXED|ANON|PRIVATE */, -1, 0);
+			if ((unsigned long)mapped == page) {
+				mapped_pages++;
+				if (mapped_pages == 1)
+					__simple_kprintf("sigsegv: mapped page %p for command buffer store", (void*)page);
+				return;
+			}
+		}
+	}
+
+	{
+		struct linux_sigaction sa;
+		sa.sa_sigaction = NULL;
+		sa.sa_mask = 0;
+		sa.sa_flags = 0;
+		sa.sa_restorer = NULL;
+		LINUX_SYSCALL(__NR_rt_sigaction, signum, &sa, NULL, sizeof(sa.sa_mask));
+	}
+}
+
 void sigexc_setup(void)
 {
 	darling_sigexc_self();
 	sigexc_setup1();
 	sigexc_setup2();
+	{
+		struct linux_sigaction sa;
+		sa.sa_sigaction = (linux_sig_handler*)sigsegv_keep_page;
+		sa.sa_mask = (1ull << (LINUX_SIGSEGV - 1));
+		sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO | LINUX_SA_RESTART;
+		sa.sa_restorer = sig_restorer;
+		LINUX_SYSCALL(__NR_rt_sigaction, LINUX_SIGSEGV, &sa, NULL, sizeof(sa.sa_mask));
+	}
 
 #ifdef VARIANT_DYLD
 	bool started_suspended;
