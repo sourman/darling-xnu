@@ -394,7 +394,8 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	 */
 	if (linux_signum == 5 && ctxt != NULL) {
 		unsigned char *ip = (unsigned char *)ctxt->uc_mcontext.gregs.rip;
-		if (ip != NULL && ip[0] == 0xc3 && ip[-2] == 0x0f && ip[-1] == 0x05) {
+		if (ip != NULL && ((ip[0] == 0xc3 && ip[-2] == 0x0f && ip[-1] == 0x05)
+				|| (ip[0] == 0x0f && ip[1] == 0x05 && ip[2] == 0xc3))) {
 			/*
 			 * Do not call the server. That RPC syscalls, the next
 			 * SIGTRAP nests on the 48K alt stack, and the GPU dies
