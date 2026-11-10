@@ -182,10 +182,17 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int ret = dserver_rpc_thread_suspended(&tstate, &fstate);
 	if (ret < 0) {
 		__simple_printf("dserver_rpc_thread_suspended failed internally: %d", ret);
-		__simple_abort();
+		/*
+		 * -70 is -LINUX_ECOMM. The recv got another call's reply
+		 * (egl215: number 4 kprintf, code 0, length 8) instead of
+		 * call 23. Aborting here kills the browser before the
+		 * display link. The register state was not updated.
+		 */
+		if (ret != -LINUX_ECOMM)
+			__simple_abort();
+	} else {
+		state_from_kernel(ctxt, &tstate, &fstate);
 	}
-
-	state_from_kernel(ctxt, &tstate, &fstate);
 	} else if (signum == SIGNAL_S2C) {
 		__simple_kprintf("sigexc: sigrt_handler S2C");
 
