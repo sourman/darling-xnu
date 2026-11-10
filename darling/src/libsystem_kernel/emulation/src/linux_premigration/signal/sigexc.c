@@ -149,6 +149,41 @@ static void sigsegv_keep_page(int signum, struct linux_siginfo* info, void* ctxt
 		}
 	}
 
+	/*
+	 * Host ld-linux __strstr_sse2_unaligned does movdqa (%rsi), %xmm2.
+	 * VizCompositorThread reached it with rsi == 0, so the needle was
+	 * NULL. Point rsi at a byte that will not match and retry.
+	 */
+	if (ctxt != NULL && info != NULL && info->si_addr == NULL) {
+		static int null_needles;
+		static char miss[2] = { 1, 0 };
+		char hay[81];
+		int i;
+		unsigned char* s;
+		uctx = (struct linux_ucontext*)ctxt;
+		insn = (unsigned char*)uctx->uc_mcontext.gregs.rip;
+		if (uctx->uc_mcontext.gregs.rsi == 0
+				&& insn[0] == 0x66 && insn[1] == 0x0f
+				&& insn[2] == 0x12 && insn[3] == 0x16) {
+			s = (unsigned char*)uctx->uc_mcontext.gregs.rdi;
+			hay[0] = 0;
+			if (s != NULL) {
+				for (i = 0; i < 80; i++) {
+					hay[i] = s[i];
+					if (s[i] == 0)
+						break;
+				}
+				hay[i < 80 ? i : 80] = 0;
+			}
+			if (null_needles < 4) {
+				null_needles++;
+				__simple_printf("strstr null needle haystack=\"%s\"\n", hay);
+			}
+			uctx->uc_mcontext.gregs.rsi = (long long)miss;
+			return;
+		}
+	}
+
 	{
 		struct linux_sigaction sa;
 		sa.sa_sigaction = NULL;
