@@ -55,16 +55,60 @@ void* sys_mmap(void* start, unsigned long len, int prot, int flags, int fd, long
 	return ret;
 }
 
+extern void darling_forget_mach_msg_page(unsigned long page);
+extern int darling_mach_msg_pages_in(unsigned long start, unsigned long end, unsigned long* out, int max);
+
 long sys_munmap(void* addr, unsigned long len)
 {
 	int ret;
+	unsigned long start = (unsigned long)addr;
+	unsigned long kept[8];
+	int nkept = 0;
 
-	ret = LINUX_SYSCALL2(__NR_munmap, addr, len);
+	if (len == 4096)
+		darling_forget_mach_msg_page(start);
+	else if (len > 4096)
+		nkept = darling_mach_msg_pages_in(start, start + len, kept, 8);
+
+	if (!nkept) {
+		ret = LINUX_SYSCALL2(__NR_munmap, addr, len);
+		if (ret < 0)
+			ret = errno_linux_to_bsd(ret);
+		return ret;
+	}
+
+	for (int i = 0; i < nkept; i++) {
+		for (int j = i + 1; j < nkept; j++) {
+			if (kept[j] < kept[i]) {
+				unsigned long tmp = kept[i];
+				kept[i] = kept[j];
+				kept[j] = tmp;
+			}
+		}
+	}
+
+	unsigned long cursor = start;
+	unsigned long end = start + len;
+	ret = 0;
+	for (int i = 0; i < nkept; i++) {
+		if (kept[i] > cursor) {
+			int part = LINUX_SYSCALL2(__NR_munmap, (void*)cursor, kept[i] - cursor);
+			if (part < 0)
+				ret = part;
+		}
+		if (kept[i] + 4096 > cursor)
+			cursor = kept[i] + 4096;
+	}
+	if (cursor < end) {
+		int part = LINUX_SYSCALL2(__NR_munmap, (void*)cursor, end - cursor);
+		if (part < 0)
+			ret = part;
+	}
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
-
 	return ret;
 }
+
 
 long sys_mprotect(void* addr, unsigned long len, int prot)
 {

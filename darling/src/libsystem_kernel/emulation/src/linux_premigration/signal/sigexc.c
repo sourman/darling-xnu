@@ -113,11 +113,100 @@ static void handle_rt_signal(int signum)
 	//external/lkm_call(0x1028, buf);
 }
 
+static void sigsegv_keep_page(int signum, struct linux_siginfo* info, void* ctxt)
+{
+	unsigned long addr;
+	unsigned long page;
+	long mapped;
+	static int mapped_pages;
+	struct linux_ucontext* uctx;
+	unsigned char* insn;
+
+	/*
+	 * SetBucketContents writes the SetBucketSize header
+	 * (movl $0x400003, (%rax)) through CommandBufferHelper::GetSpace.
+	 * That page is not mapped, and the store kills the browser before
+	 * the GPU present. Map the page and retry the instruction.
+	 */
+	if (info != NULL && info->si_code == 1 && mapped_pages < 4 && ctxt != NULL) {
+		addr = (unsigned long)info->si_addr;
+		uctx = (struct linux_ucontext*)ctxt;
+		insn = (unsigned char*)uctx->uc_mcontext.gregs.rip;
+		/* c7 00 03 00 40 00 is movl $0x400003, (%rax) */
+		if (addr >= 0x100000000ull
+				&& insn[0] == 0xc7 && insn[1] == 0x00
+				&& insn[2] == 0x03 && insn[3] == 0x00
+				&& insn[4] == 0x40 && insn[5] == 0x00) {
+			page = addr & ~0xffful;
+			mapped = LINUX_SYSCALL6(__NR_mmap, (void*)page, 4096,
+					3 /* RW */, 0x32 /* FIXED|ANON|PRIVATE */, -1, 0);
+			if ((unsigned long)mapped == page) {
+				mapped_pages++;
+				if (mapped_pages == 1)
+					__simple_kprintf("sigsegv: mapped page %p for command buffer store", (void*)page);
+				return;
+			}
+		}
+	}
+
+	/*
+	 * Host ld-linux __strstr_sse2_unaligned does movdqa (%rsi), %xmm2.
+	 * VizCompositorThread reached it with rsi == 0, so the needle was
+	 * NULL. Point rsi at a byte that will not match and retry.
+	 */
+	if (ctxt != NULL && info != NULL && info->si_addr == NULL) {
+		static int null_needles;
+		static char miss[2] = { 1, 0 };
+		char hay[81];
+		int i;
+		unsigned char* s;
+		uctx = (struct linux_ucontext*)ctxt;
+		insn = (unsigned char*)uctx->uc_mcontext.gregs.rip;
+		if (uctx->uc_mcontext.gregs.rsi == 0
+				&& insn[0] == 0x66 && insn[1] == 0x0f
+				&& insn[2] == 0x12 && insn[3] == 0x16) {
+			s = (unsigned char*)uctx->uc_mcontext.gregs.rdi;
+			hay[0] = 0;
+			if (s != NULL) {
+				for (i = 0; i < 80; i++) {
+					hay[i] = s[i];
+					if (s[i] == 0)
+						break;
+				}
+				hay[i < 80 ? i : 80] = 0;
+			}
+			if (null_needles < 4) {
+				null_needles++;
+				__simple_printf("strstr null needle haystack=\"%s\"\n", hay);
+			}
+			uctx->uc_mcontext.gregs.rsi = (long long)miss;
+			return;
+		}
+	}
+
+	{
+		struct linux_sigaction sa;
+		sa.sa_sigaction = NULL;
+		sa.sa_mask = 0;
+		sa.sa_flags = 0;
+		sa.sa_restorer = NULL;
+		LINUX_SYSCALL(__NR_rt_sigaction, signum, &sa, NULL, sizeof(sa.sa_mask));
+	}
+}
+
 void sigexc_setup(void)
 {
 	darling_sigexc_self();
 	sigexc_setup1();
 	sigexc_setup2();
+	{
+		struct linux_sigaction sa;
+		sa.sa_sigaction = (linux_sig_handler*)sigsegv_keep_page;
+		sa.sa_mask = (1ull << (LINUX_SIGSEGV - 1));
+		sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO | LINUX_SA_RESTART;
+		sa.sa_restorer = sig_restorer;
+		LINUX_SYSCALL(__NR_rt_sigaction, LINUX_SIGSEGV, &sa, NULL, sizeof(sa.sa_mask));
+	}
 
 #ifdef VARIANT_DYLD
 	bool started_suspended;
@@ -138,8 +227,15 @@ void sigexc_setup(void)
 			__simple_abort();
 		}
 		if (tracer != 0) {
-			kern_printf("sigexc: already traced -> SIGTRAP\n");
-			sys_kill(0, SIGTRAP, 0);
+			/*
+			 * A non-zero tracer means a PT_TRACE_ME/PT_ATTACHEXC parent was
+			 * recorded. kill(0) is the process group, so this SIGTRAP also
+			 * hits every other Darling process in the container (browser,
+			 * GPU) while they sit in _linux_syscall. There is no debugger
+			 * consuming EXC_BREAKPOINT here, and the default-effect path
+			 * below would reset SIG_DFL and kill the group again. Continue.
+			 */
+			kern_printf("sigexc: already traced (tracer %d) -> not signaling the process group\n", tracer);
 		}
 	}
 #else
@@ -175,10 +271,17 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int ret = dserver_rpc_thread_suspended(&tstate, &fstate);
 	if (ret < 0) {
 		__simple_printf("dserver_rpc_thread_suspended failed internally: %d", ret);
-		__simple_abort();
+		/*
+		 * -70 is -LINUX_ECOMM. The recv got another call's reply
+		 * (egl215: number 4 kprintf, code 0, length 8) instead of
+		 * call 23. Aborting here kills the browser before the
+		 * display link. The register state was not updated.
+		 */
+		if (ret != -LINUX_ECOMM)
+			__simple_abort();
+	} else {
+		state_from_kernel(ctxt, &tstate, &fstate);
 	}
-
-	state_from_kernel(ctxt, &tstate, &fstate);
 	} else if (signum == SIGNAL_S2C) {
 		__simple_kprintf("sigexc: sigrt_handler S2C");
 
@@ -347,7 +450,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			if (bsd_signum == SIGTSTP || bsd_signum == SIGSTOP)
 			{
 				kern_printf("sigexc: emulating SIGTSTP/SIGSTOP\n");
-				LINUX_SYSCALL(__NR_kill, 0, LINUX_SIGSTOP);
+				LINUX_SYSCALL(__NR_kill, getpid(), LINUX_SIGSTOP);
 			}
 			else
 			{
@@ -363,8 +466,12 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 						&sa, NULL,
 						sizeof(sa.sa_mask));
 
-				// Resend signal to self
-				LINUX_SYSCALL(__NR_kill, 0, linux_signum);
+				/*
+				 * Resend to this process only. pid 0 is the process group,
+				 * which delivered one default SIGTRAP to mldr and CrGpuMain
+				 * together (both blocked in _linux_syscall).
+				 */
+				LINUX_SYSCALL(__NR_kill, getpid(), linux_signum);
 			}
 		}
 	}

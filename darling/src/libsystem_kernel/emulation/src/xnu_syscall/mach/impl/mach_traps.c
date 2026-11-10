@@ -17,6 +17,34 @@
 
 #define UNIMPLEMENTED_TRAP() { char msg[] = "Called unimplemented Mach trap: "; write(2, msg, sizeof(msg)-1); write(2, __FUNCTION__, sizeof(__FUNCTION__)-1); write(2, "\n", 1); }
 
+static uintptr_t mach_msg_pages[32];
+static int mach_msg_page_count;
+
+void darling_note_mach_msg_page(uintptr_t page) {
+	int slot = mach_msg_page_count < 32 ? mach_msg_page_count : (mach_msg_page_count & 31);
+	mach_msg_pages[slot] = page;
+	mach_msg_page_count++;
+}
+
+void darling_forget_mach_msg_page(uintptr_t page) {
+	int lim = mach_msg_page_count < 32 ? mach_msg_page_count : 32;
+	for (int i = 0; i < lim; i++) {
+		if (mach_msg_pages[i] == page)
+			mach_msg_pages[i] = 0;
+	}
+}
+
+int darling_mach_msg_pages_in(uintptr_t start, uintptr_t end, uintptr_t* out, int max) {
+	int n = 0;
+	int lim = mach_msg_page_count < 32 ? mach_msg_page_count : 32;
+	for (int i = 0; i < lim && n < max; i++) {
+		uintptr_t page = mach_msg_pages[i];
+		if (page && page >= start && page + 4096 <= end)
+			out[n++] = page;
+	}
+	return n;
+}
+
 mach_port_name_t mach_reply_port_impl(void)
 {
 	unsigned int port_name;
@@ -348,8 +376,11 @@ kern_return_t _kernelrpc_mach_vm_map_trap_impl(
 	if ((flags >> 24) == VM_MEMORY_REALLOC)
 		addr = (void*)__linux_mremap(((char*)*address) - 0x1000, 0x1000, 0x1000 + size, 0, NULL);
 	else
-		addr = mmap((void*)*address, size, prot, posix_flags, -1, 0);
-	
+		addr = mmap((flags & VM_FLAGS_ANYWHERE) ? NULL : (void*)*address, size, prot, posix_flags, -1, 0);
+
+	if (addr != MAP_FAILED && size == 4096 && (flags >> 24) == VM_MEMORY_MACH_MSG)
+		darling_note_mach_msg_page((uintptr_t)addr);
+
 	if (addr == MAP_FAILED)
 	{
 		return KERN_FAILURE;
