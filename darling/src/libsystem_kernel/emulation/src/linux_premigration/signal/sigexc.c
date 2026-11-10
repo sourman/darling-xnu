@@ -119,6 +119,8 @@ static void sigsegv_keep_page(int signum, struct linux_siginfo* info, void* ctxt
 	unsigned long page;
 	long mapped;
 	static int mapped_pages;
+	struct linux_ucontext* uctx;
+	unsigned char* insn;
 
 	/*
 	 * SetBucketContents writes the SetBucketSize header
@@ -126,9 +128,15 @@ static void sigsegv_keep_page(int signum, struct linux_siginfo* info, void* ctxt
 	 * That page is not mapped, and the store kills the browser before
 	 * the GPU present. Map the page and retry the instruction.
 	 */
-	if (info != NULL && info->si_code == 1 && mapped_pages < 32) {
+	if (info != NULL && info->si_code == 1 && mapped_pages < 4 && ctxt != NULL) {
 		addr = (unsigned long)info->si_addr;
-		if (addr >= 0x100000000ull) {
+		uctx = (struct linux_ucontext*)ctxt;
+		insn = (unsigned char*)uctx->uc_mcontext.gregs.rip;
+		/* c7 00 03 00 40 00 is movl $0x400003, (%rax) */
+		if (addr >= 0x100000000ull
+				&& insn[0] == 0xc7 && insn[1] == 0x00
+				&& insn[2] == 0x03 && insn[3] == 0x00
+				&& insn[4] == 0x40 && insn[5] == 0x00) {
 			page = addr & ~0xffful;
 			mapped = LINUX_SYSCALL6(__NR_mmap, (void*)page, 4096,
 					3 /* RW */, 0x32 /* FIXED|ANON|PRIVATE */, -1, 0);
