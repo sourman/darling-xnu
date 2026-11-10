@@ -91,6 +91,14 @@ retry:
 				goto retry;
 			}
 		}
+		/*
+		 * -111 is LINUX_ECONNREFUSED from a darlingserver socket that
+		 * dropped during mach_make_memory_entry. Aborting here is what
+		 * kills the GPU helper before it creates an IOSurface.
+		 */
+		if (code == -LINUX_ECONNREFUSED) {
+			return KERN_FAILURE;
+		}
 		__simple_printf("mach_msg_overwrite failed (internally): %d\n", code);
 		__simple_abort();
 	}
@@ -104,6 +112,8 @@ kern_return_t semaphore_signal_trap_impl(
 	int code = dserver_rpc_semaphore_signal(signal_name);
 
 	if (code < 0) {
+		if (code == -LINUX_ECONNREFUSED)
+			return KERN_FAILURE;
 		__simple_printf("semaphore_signal failed (internally): %d\n", code);
 		__simple_abort();
 	}
@@ -176,6 +186,8 @@ kern_return_t semaphore_timedwait_trap_impl(
 		if (code == -LINUX_EINTR) {
 			return KERN_ABORTED;
 		}
+		if (code == -LINUX_ECONNREFUSED)
+			return KERN_FAILURE;
 		__simple_printf("semaphore_timedwait failed (internally): %d\n", code);
 		__simple_abort();
 	}

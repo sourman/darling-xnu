@@ -14,6 +14,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/kill.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/conversion/duct_errno.h>
 
 #include <darlingserver/rpc.h>
 
@@ -152,6 +153,8 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		if (status == -LINUX_ECONNREFUSED)
+			return;
 		__simple_abort();
 	}
 
@@ -273,6 +276,8 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		if (status == -LINUX_ECONNREFUSED)
+			return;
 		__simple_abort();
 	}
 
