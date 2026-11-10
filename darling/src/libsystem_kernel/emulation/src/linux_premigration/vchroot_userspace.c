@@ -136,6 +136,16 @@ int __darling_vchroot(int dfd)
 
 #ifndef TEST
 VISIBLE
+void __darling_vchroot_force_root(void)
+{
+	prefix_path[0] = '/';
+	prefix_path[1] = '\0';
+	prefix_path_len = 1;
+}
+#endif
+
+#ifndef TEST
+VISIBLE
 int __darling_vchroot_expand(const char* path, char* out)
 {
 	struct vchroot_expand_args a = {
