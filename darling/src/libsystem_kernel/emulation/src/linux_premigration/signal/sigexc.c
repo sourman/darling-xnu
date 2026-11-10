@@ -248,7 +248,12 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		static int refused_logs;
+		if (status != -LINUX_ECONNREFUSED || refused_logs < 4) {
+			if (status == -LINUX_ECONNREFUSED)
+				refused_logs++;
+			__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		}
 		if (status == -LINUX_ECONNREFUSED)
 			return;
 		__simple_abort();
@@ -375,10 +380,41 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
 
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
-	int status = dserver_rpc_interrupt_enter();
+	int status;
+	int syscall_ret_trap = 0;
+
+#ifdef __x86_64__
+	/*
+	 * SIGTRAP at the ret after syscall (recvmsg/epoll_wait returning
+	 * ERESTARTSYS or EINTR). state_from_kernel rewrites RIP before the
+	 * later check, so that check misses and the default-effect path
+	 * resets SIG_DFL and kills the GPU. Remember the incoming frame.
+	 * Still run the server RPC: skipping it drops the exception and
+	 * the process exits during startup.
+	 */
+	if (linux_signum == 5 && ctxt != NULL) {
+		unsigned char *ip = (unsigned char *)ctxt->uc_mcontext.gregs.rip;
+		if (ip != NULL && ((ip[0] == 0xc3 && ip[-2] == 0x0f && ip[-1] == 0x05)
+				|| (ip[0] == 0x0f && ip[1] == 0x05 && ip[2] == 0xc3))) {
+			/*
+			 * Do not call the server. That RPC syscalls, the next
+			 * SIGTRAP nests on the 48K alt stack, and the GPU dies
+			 * with "overflowed sigaltstack" still sitting in recvmsg.
+			 */
+			return;
+		}
+	}
+#endif
+
+	status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		static int refused_logs;
+		if (status != -LINUX_ECONNREFUSED || refused_logs < 4) {
+			if (status == -LINUX_ECONNREFUSED)
+				refused_logs++;
+			__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		}
 		if (status == -LINUX_ECONNREFUSED)
 			return;
 		__simple_abort();
@@ -454,6 +490,20 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			}
 			else
 			{
+				/*
+				 * A SIGTRAP delivered at the `ret` after `syscall` is the
+				 * stub coming back from epoll_wait with EINTR. Resending it
+				 * kills mldr before the GPU creates the display link.
+				 * Return into the stub and let it restart the call.
+				 */
+				if (syscall_ret_trap) {
+					static int noted;
+					if (noted < 4) {
+						noted++;
+						__simple_printf("sigexc: syscall-return SIGTRAP, not fatal\n");
+					}
+					goto out;
+				}
 				kern_printf("sigexc: emulating default signal effects\n");
 				// Set handler to SIG_DFL
 				struct linux_sigaction sa;
